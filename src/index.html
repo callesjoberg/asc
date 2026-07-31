@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="sv">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ASC - Skärmklipp & Analys</title>
+    <script type="module" src="/main.js" defer></script>
+  </head>
+
+  <body>
+    <!-- App Header -->
+    <header>
+      <div class="logo-section">
+        <h1>ASC Screen Analyzer</h1>
+        <p>Automatiserad övervakning, pixeljämförelse & OCR-analys</p>
+      </div>
+      <div class="status-indicator">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">Inaktiv</span>
+      </div>
+    </header>
+
+    <!-- App Container -->
+    <div class="app-container">
+      <!-- Sidebar Controls -->
+      <aside class="sidebar">
+        <!-- Mode Tabs -->
+        <div class="control-group">
+          <label>Arbetsläge</label>
+          <div class="tab-container">
+            <div class="tab-btn active" id="tab-live" onclick="setMode('live')">Realtid</div>
+            <div class="tab-btn" id="tab-offline" onclick="setMode('offline')">Efterhandsanalys</div>
+          </div>
+        </div>
+
+        <!-- Target Selection -->
+        <div class="control-group" id="target-selection-group">
+          <label>Klippkälla</label>
+          <div class="row-inputs">
+            <select id="source-type">
+              <option value="screen">Skärm</option>
+              <option value="window">Fönster / App</option>
+            </select>
+            <button class="btn-secondary" id="btn-refresh-sources">Uppdatera</button>
+          </div>
+          <select id="source-id" style="margin-top: 8px;">
+            <!-- Fylls i dynamiskt -->
+          </select>
+        </div>
+
+        <!-- Crop Area Coordinate selection -->
+        <div class="control-group">
+          <div class="checkbox-label" style="margin-bottom: 6px;">
+            <input type="checkbox" id="enable-crop" />
+            <label for="enable-crop" style="text-transform:none; font-size: 0.85rem; color:#fff;">Begränsa yta (Beskärning)</label>
+          </div>
+          <div class="quad-inputs hidden" id="crop-coords">
+            <div>
+              <label style="font-size:0.65rem;">X</label>
+              <input type="number" id="crop-x" value="0" min="0" />
+            </div>
+            <div>
+              <label style="font-size:0.65rem;">Y</label>
+              <input type="number" id="crop-y" value="0" min="0" />
+            </div>
+            <div>
+              <label style="font-size:0.65rem;">Bredd</label>
+              <input type="number" id="crop-w" value="300" min="1" />
+            </div>
+            <div>
+              <label style="font-size:0.65rem;">Höjd</label>
+              <input type="number" id="crop-h" value="100" min="1" />
+            </div>
+          </div>
+        </div>
+
+        <!-- Interval (Only for Live Mode) -->
+        <div class="control-group" id="interval-group">
+          <label for="interval-secs">Tidsintervall (sekunder)</label>
+          <input type="number" id="interval-secs" value="10" min="1" />
+        </div>
+
+        <!-- Directory selector -->
+        <div class="control-group">
+          <label id="dir-label">Spara skärmklipp i mapp</label>
+          <div class="path-selector">
+            <input type="text" id="save-dir" placeholder="Välj mapp..." readonly />
+            <button class="btn-secondary" id="btn-select-dir">Bläddra</button>
+          </div>
+        </div>
+
+        <!-- OCR Settings -->
+        <div class="control-group">
+          <div class="checkbox-label" style="margin-bottom: 6px;">
+            <input type="checkbox" id="enable-ocr" />
+            <label for="enable-ocr" style="text-transform:none; font-size: 0.85rem; color:#fff;">Aktivera OCR (Textavläsning)</label>
+          </div>
+          <div class="checkbox-label hidden" id="ocr-crop-checkbox-container" style="margin-bottom: 6px; padding-left: 20px;">
+            <input type="checkbox" id="enable-ocr-crop" />
+            <label for="enable-ocr-crop" style="text-transform:none; font-size: 0.8rem; color:var(--text-secondary);">Beskär OCR-område separat</label>
+          </div>
+          <div class="quad-inputs hidden" id="ocr-coords" style="padding-left: 20px;">
+            <div>
+              <label style="font-size:0.65rem;">X</label>
+              <input type="number" id="ocr-x" value="0" min="0" />
+            </div>
+            <div>
+              <label style="font-size:0.65rem;">Y</label>
+              <input type="number" id="ocr-y" value="0" min="0" />
+            </div>
+            <div>
+              <label style="font-size:0.65rem;">Bredd</label>
+              <input type="number" id="ocr-w" value="150" min="1" />
+            </div>
+            <div>
+              <label style="font-size:0.65rem;">Höjd</label>
+              <input type="number" id="ocr-h" value="40" min="1" />
+            </div>
+          </div>
+        </div>
+
+        <!-- Sensitivity / Threshold -->
+        <div class="control-group" id="sensitivity-group">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <label for="diff-threshold">Tröskelvärde (Pixeländring)</label>
+            <span id="threshold-val" style="font-size: 0.8rem; font-weight:600; color:var(--accent);">2.0%</span>
+          </div>
+          <input type="range" id="diff-threshold" min="0.1" max="25" step="0.1" value="2.0" style="accent-color:var(--accent);" />
+        </div>
+
+        <!-- Main Run Button -->
+        <button class="btn-primary" id="btn-main-action">Starta övervakning</button>
+      </aside>
+
+      <!-- Main Dashboard Area -->
+      <main class="dashboard">
+        <!-- Top row: Chart & Preview -->
+        <div class="dashboard-row">
+          <!-- Pixel Diff History Chart -->
+          <section class="card">
+            <div class="card-title">
+              <span>Pixeländring över tid</span>
+              <span style="font-size: 0.75rem; color: var(--text-muted);">Uppdateras live</span>
+            </div>
+            <div class="chart-container">
+              <canvas id="diff-chart"></canvas>
+            </div>
+          </section>
+
+          <!-- Status & Preview Card -->
+          <section class="card">
+            <div class="card-title">Senaste skärmklipp</div>
+            <div class="preview-box">
+              <div class="placeholder" id="preview-placeholder">Ingen bild sparad ännu. Starta övervakningen för att fånga skärmklipp.</div>
+              <img id="preview-img" class="hidden" src="" alt="Senaste skärmklipp" />
+            </div>
+            <!-- Quick Stats -->
+            <div class="stats-grid">
+              <div class="stat-item">
+                <div class="stat-label">Sparade</div>
+                <div class="stat-val" id="stat-total">0</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-label">Ändringar</div>
+                <div class="stat-val" id="stat-changes" style="color:var(--warning);">0</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-label">Snitt-diff</div>
+                <div class="stat-val" id="stat-avg">0.0%</div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- Bottom row: Log List -->
+        <section class="card log-card">
+          <div class="card-title">
+            <span>Händelselogg</span>
+            <button class="btn-secondary" id="btn-clear-log" style="padding: 4px 10px; font-size:0.75rem;">Rensa logg</button>
+          </div>
+          <div class="table-wrapper">
+            <table id="log-table">
+              <thead>
+                <tr>
+                  <th style="width: 15%;">Tid</th>
+                  <th style="width: 25%;">Filnamn</th>
+                  <th style="width: 15%;">Pixel-diff</th>
+                  <th style="width: 30%;">OCR Text (Avläst)</th>
+                  <th style="width: 15%;">Status</th>
+                </tr>
+              </thead>
+              <tbody id="log-tbody">
+                <tr>
+                  <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 30px;">Loggen är tom. Ingen övervakning har gjorts.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,55 @@
+#import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
+#import <Vision/Vision.h>
+
+int main(int argc, const char * argv[]) {
+    @autoreleasepool {
+        if (argc < 2) {
+            printf("Error: Missing image path argument.\n");
+            return 1;
+        }
+        
+        NSString *imagePath = [NSString stringWithUTF8String:argv[1]];
+        NSURL *fileURL = [NSURL fileURLWithPath:imagePath];
+        
+        NSImage *image = [[NSImage alloc] initWithContentsOfURL:fileURL];
+        if (!image) {
+            printf("Error: Could not load image from %s\n", argv[1]);
+            return 1;
+        }
+        
+        CGImageRef cgImage = [image CGImageForProposedRect:NULL context:nil hints:nil];
+        if (!cgImage) {
+            printf("Error: Could not get CGImage from NSImage\n");
+            return 1;
+        }
+        
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
+        
+        VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest * _Nonnull request, NSError * _Nullable error) {
+            if (error) {
+                printf("OCR Error: %s\n", [[error localizedDescription] UTF8String]);
+                exit(1);
+            }
+            
+            NSArray *results = request.results;
+            for (VNRecognizedTextObservation *observation in results) {
+                NSArray<VNRecognizedText *> *topCandidates = [observation topCandidates:1];
+                if (topCandidates.count > 0) {
+                    printf("%s\n", [[topCandidates[0] string] UTF8String]);
+                }
+            }
+        }];
+        
+        request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+        request.usesLanguageCorrection = YES;
+        
+        NSError *error = nil;
+        [handler performRequests:@[request] error:&error];
+        if (error) {
+            printf("Error performing OCR request: %s\n", [[error localizedDescription] UTF8String]);
+            return 1;
+        }
+    }
+    return 0;
+}
