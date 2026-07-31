@@ -79,6 +79,7 @@ struct AscApp {
     // Trådkommunikation
     log_receiver: Option<Receiver<WorkerMessage>>,
     control_sender: Option<Sender<ControlMessage>>,
+    folder_receiver: Option<Receiver<Option<String>>>,
 }
 
 impl Default for AscApp {
@@ -121,6 +122,7 @@ impl Default for AscApp {
             selected_preview_file: None,
             log_receiver: None,
             control_sender: None,
+            folder_receiver: None,
         };
         app.refresh_sources();
         app
@@ -792,6 +794,24 @@ impl AscApp {
 
 impl eframe::App for AscApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let folder_result =
+            self.folder_receiver
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(folder) => Some(folder),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                });
+        if let Some(folder) = folder_result {
+            self.folder_receiver = None;
+            if let Some(folder) = folder {
+                self.save_dir = folder;
+                self.status_text = "Mapp vald.".to_string();
+            } else {
+                self.status_text = "Mappval avbrutet.".to_string();
+            }
+        }
+
         // Kontrollera om vi tagit emot meddelanden från bakgrundstråden
         let mut should_clear_receiver = false;
         let mut analysis_changed = false;
@@ -958,12 +978,30 @@ impl eframe::App for AscApp {
                     });
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.save_dir);
-                        if ui.button("Bläddra...").clicked() {
-                            if let Some(folder) =
-                                rfd::FileDialog::new().set_title("Välj mapp").pick_folder()
-                            {
-                                self.save_dir = folder.to_string_lossy().to_string();
-                            }
+                        let picker_running = self.folder_receiver.is_some();
+                        if ui
+                            .add_enabled(
+                                !picker_running,
+                                egui::Button::new(if picker_running {
+                                    "Öppnar…"
+                                } else {
+                                    "Bläddra..."
+                                }),
+                            )
+                            .clicked()
+                        {
+                            let (folder_tx, folder_rx) = channel();
+                            self.folder_receiver = Some(folder_rx);
+                            self.status_text = "Öppnar mappväljaren…".to_string();
+                            let repaint_ctx = ctx.clone();
+                            std::thread::spawn(move || {
+                                let folder = rfd::FileDialog::new()
+                                    .set_title("Välj mapp")
+                                    .pick_folder()
+                                    .map(|path| path.to_string_lossy().to_string());
+                                let _ = folder_tx.send(folder);
+                                repaint_ctx.request_repaint();
+                            });
                         }
                     });
                     if !self.save_dir.is_empty() {
