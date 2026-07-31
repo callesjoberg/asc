@@ -67,6 +67,8 @@ struct AscApp {
     // Bildförhandsgranskning
     preview_texture: Option<egui::TextureHandle>,
     preview_size: Option<[usize; 2]>,
+    preview_zoom: f32,
+    preview_pan: egui::Vec2,
 
     // Trådkommunikation
     log_receiver: Option<Receiver<WorkerMessage>>,
@@ -103,6 +105,8 @@ impl Default for AscApp {
             monitors: Vec::new(),
             preview_texture: None,
             preview_size: None,
+            preview_zoom: 1.0,
+            preview_pan: egui::Vec2::ZERO,
             log_receiver: None,
             control_sender: None,
         };
@@ -169,6 +173,8 @@ impl AscApp {
         self.total_changes = 0;
         self.preview_texture = None;
         self.preview_size = None;
+        self.preview_zoom = 1.0;
+        self.preview_pan = egui::Vec2::ZERO;
 
         let (log_tx, log_rx) = channel();
         let (control_tx, control_rx) = channel();
@@ -325,6 +331,8 @@ impl AscApp {
         self.total_changes = 0;
         self.preview_texture = None;
         self.preview_size = None;
+        self.preview_zoom = 1.0;
+        self.preview_pan = egui::Vec2::ZERO;
 
         let (log_tx, log_rx) = channel();
         self.log_receiver = Some(log_rx);
@@ -477,6 +485,139 @@ impl AscApp {
     }
 }
 
+impl AscApp {
+    fn show_log_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Händelselogg:");
+            if ui.button("Rensa logg").clicked() {
+                self.logs.clear();
+                self.diffs_history.clear();
+                self.total_captures = 0;
+                self.total_changes = 0;
+                if let Err(error) = self.export_analysis() {
+                    self.status_text = format!("Exportfel: {error}");
+                }
+            }
+        });
+
+        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+            egui::Grid::new("log_grid")
+                .striped(true)
+                .num_columns(4)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Tid");
+                    ui.label("Diff %");
+                    ui.label("OCR-text");
+                    ui.label("Status");
+                    ui.end_row();
+
+                    for log in self.logs.iter().rev() {
+                        ui.label(&log.timestamp).on_hover_text(&log.file_name);
+                        ui.label(format!("{:.2}%", log.pixel_diff * 100.0));
+
+                        let short_ocr = if log.ocr_text.chars().count() > 25 {
+                            format!("{}...", log.ocr_text.chars().take(25).collect::<String>())
+                        } else {
+                            log.ocr_text.clone()
+                        };
+                        ui.label(short_ocr).on_hover_text(&log.ocr_text);
+
+                        if log.is_changed {
+                            ui.colored_label(egui::Color32::GREEN, "Ändrad");
+                        } else {
+                            ui.label("Ingen ändring");
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn show_preview_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Senaste skärmklipp:");
+            if ui
+                .button("Anpassa")
+                .on_hover_text("Visa hela bilden")
+                .clicked()
+            {
+                self.preview_zoom = 1.0;
+                self.preview_pan = egui::Vec2::ZERO;
+            }
+            ui.add(
+                egui::Slider::new(&mut self.preview_zoom, 0.1..=8.0)
+                    .logarithmic(true)
+                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+            )
+            .on_hover_text("Zoom relativt Anpassa-läget");
+            ui.label("Rulla för zoom · dra för panorering · dubbelklicka för Anpassa");
+        });
+        ui.separator();
+
+        let canvas_size = egui::vec2(
+            ui.available_width().max(1.0),
+            ui.available_height().max(1.0),
+        );
+        let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(40));
+
+        let (Some(texture_id), Some(size)) = (
+            self.preview_texture.as_ref().map(|texture| texture.id()),
+            self.preview_size,
+        ) else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Ingen bild att visa",
+                egui::FontId::proportional(12.0),
+                egui::Color32::GRAY,
+            );
+            return;
+        };
+
+        if response.double_clicked() {
+            self.preview_zoom = 1.0;
+            self.preview_pan = egui::Vec2::ZERO;
+        }
+        if response.hovered() {
+            let scroll = ui.input(|input| input.raw_scroll_delta.y);
+            if scroll != 0.0 {
+                self.preview_zoom = (self.preview_zoom * (scroll * 0.0015).exp()).clamp(0.1, 8.0);
+            }
+        }
+        if response.dragged_by(egui::PointerButton::Primary) {
+            self.preview_pan += ui.input(|input| input.pointer.delta());
+        }
+
+        let image_size = egui::vec2(size[0] as f32, size[1] as f32);
+        let fit_scale = (rect.width() / image_size.x)
+            .min(rect.height() / image_size.y)
+            .max(f32::EPSILON);
+        let draw_size = image_size * fit_scale * self.preview_zoom;
+        let max_pan = ((draw_size - rect.size()) * 0.5).max(egui::Vec2::ZERO);
+        self.preview_pan.x = self.preview_pan.x.clamp(-max_pan.x, max_pan.x);
+        self.preview_pan.y = self.preview_pan.y.clamp(-max_pan.y, max_pan.y);
+
+        let image_rect = egui::Rect::from_center_size(rect.center() + self.preview_pan, draw_size);
+        painter.image(
+            texture_id,
+            image_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(if response.dragged() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+        }
+    }
+}
+
 impl eframe::App for AscApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Kontrollera om vi tagit emot meddelanden från bakgrundstråden
@@ -526,8 +667,10 @@ impl eframe::App for AscApp {
 
         // Definiera det övergripande gränssnittet
         egui::SidePanel::left("left_panel")
-            .resizable(false)
+            .resizable(true)
             .default_width(320.0)
+            .min_width(260.0)
+            .max_width(520.0)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.heading("ASC - Skärmklipp & Analys");
@@ -868,97 +1011,13 @@ impl eframe::App for AscApp {
 
             ui.add_space(10.0);
 
-            // Dela upp botten i två kolumner: Loggar till vänster, Förhandsgranskning till höger
-            ui.columns(2, |cols| {
-                // Vänster kolumn: Loggar
-                cols[0].vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Händelselogg:");
-                        if ui.button("Rensa logg").clicked() {
-                            self.logs.clear();
-                            self.diffs_history.clear();
-                            self.total_captures = 0;
-                            self.total_changes = 0;
-                            if let Err(error) = self.export_analysis() {
-                                self.status_text = format!("Exportfel: {error}");
-                            }
-                        }
-                    });
-
-                    let log_table_height = ui.available_height() - 10.0;
-                    egui::ScrollArea::vertical()
-                        .max_height(log_table_height)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            egui::Grid::new("log_grid")
-                                .striped(true)
-                                .num_columns(4)
-                                .spacing([10.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label("Tid");
-                                    ui.label("Diff %");
-                                    ui.label("OCR-text");
-                                    ui.label("Status");
-                                    ui.end_row();
-
-                                    for log in self.logs.iter().rev() {
-                                        ui.label(&log.timestamp);
-                                        ui.label(format!("{:.2}%", log.pixel_diff * 100.0));
-
-                                        // Begränsa OCR-textens längd i tabellen
-                                        let short_ocr = if log.ocr_text.chars().count() > 25 {
-                                            format!(
-                                                "{}...",
-                                                log.ocr_text.chars().take(25).collect::<String>()
-                                            )
-                                        } else {
-                                            log.ocr_text.clone()
-                                        };
-                                        ui.label(short_ocr).on_hover_text(&log.ocr_text);
-
-                                        if log.is_changed {
-                                            ui.colored_label(egui::Color32::GREEN, "Ändrad");
-                                        } else {
-                                            ui.label("Ingen ändring");
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                });
-
-                // Höger kolumn: Senaste bild
-                cols[1].vertical(|ui| {
-                    ui.label("Senaste skärmklipp:");
-                    if let Some(ref texture) = self.preview_texture {
-                        if let Some(size) = self.preview_size {
-                            // Skala bilden så att den passar inom kolumnbredden
-                            let available_w = ui.available_width();
-                            let aspect_ratio = size[0] as f32 / size[1] as f32;
-                            let draw_w = available_w;
-                            let draw_h = draw_w / aspect_ratio;
-
-                            ui.image((texture.id(), egui::vec2(draw_w, draw_h)));
-                        }
-                    } else {
-                        // Visa en tom platshållare
-                        let h = ui.available_height() - 10.0;
-                        let (rect, _response) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), h),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(rect);
-                        painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(20));
-                        painter.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "Ingen bild att visa",
-                            egui::FontId::proportional(12.0),
-                            egui::Color32::GRAY,
-                        );
-                    }
-                });
-            });
+            egui::SidePanel::left("log_panel")
+                .resizable(true)
+                .default_width(420.0)
+                .min_width(260.0)
+                .max_width(720.0)
+                .show_inside(ui, |ui| self.show_log_panel(ui));
+            egui::CentralPanel::default().show_inside(ui, |ui| self.show_preview_panel(ui));
         });
     }
 }

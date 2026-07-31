@@ -9,7 +9,8 @@ ASC är en plattformsoberoende skrivbordsapp för att övervaka skärmar eller f
 - Förändringsanalys med justerbar pixeltröskel
 - Inbyggd OCR på macOS och Windows
 - Efterhandsanalys av PNG- och JPEG-bilder i en mapp
-- Förhandsgranskning, statistik, graf och händelselogg
+- Justerbara paneler för inställningar, händelselogg och förhandsgranskning
+- Skärmklippsvisning som passar hela bilden, med zoom och panorering
 - Automatisk export till `asc-analysis.csv` och `asc-analysis.json`
 
 ## Utveckling
