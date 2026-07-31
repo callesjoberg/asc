@@ -5,6 +5,13 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default"
+    "opener:default",
+    "allow-list-windows",
+    "allow-list-monitors",
+    "allow-select-folder",
+    "allow-start-capture",
+    "allow-stop-capture",
+    "allow-get-capture-status",
+    "allow-run-offline-analysis"
   ]
 }
