@@ -1,10 +1,21 @@
+use std::fs;
+use std::env;
+use std::path::PathBuf;
 use std::process::Command;
-use tauri::{AppHandle, Manager};
-use tauri::path::BaseDirectory;
+use tauri::AppHandle;
 
-/// Utför OCR på en bildfil genom att anropa det plattformsspecifika hjälpprogrammet.
+// Villkorlig kompilering: Bädda in rätt hjälpprogram i själva binären baserat på målsystem
+#[cfg(target_os = "windows")]
+const OCR_HELPER_BYTES: &[u8] = include_bytes!("../resources/ocr-helper-win.exe");
+
+#[cfg(target_os = "macos")]
+const OCR_HELPER_BYTES: &[u8] = include_bytes!("../resources/ocr-helper-macos");
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const OCR_HELPER_BYTES: &[u8] = &[];
+
+/// Utför OCR på en bildfil genom att anropa det inbäddade hjälpprogrammet.
 pub fn run_ocr(app_handle: &AppHandle, image_path: &str) -> Result<String, String> {
-    // Bestäm resursnamnet baserat på operativsystemet
     let binary_name = if cfg!(target_os = "windows") {
         "ocr-helper-win.exe"
     } else if cfg!(target_os = "macos") {
@@ -13,25 +24,32 @@ pub fn run_ocr(app_handle: &AppHandle, image_path: &str) -> Result<String, Strin
         return Err("OCR stöds inte på det här operativsystemet för närvarande.".to_string());
     };
 
-    // Hitta sökvägen till resursen enligt Tauri v2 standarder
-    let resource_path = app_handle
-        .path()
-        .resolve(format!("resources/{}", binary_name), BaseDirectory::Resource)
-        .map_err(|e| format!("Kunde inte lösa resursvägen för {}: {}", binary_name, e))?;
+    // Extrahera hjälpprogrammet till systemets temp-mapp för körning
+    let temp_dir = env::temp_dir();
+    let helper_path = temp_dir.join(binary_name);
 
-    // Kontrollera om filen faktiskt finns innan vi anropar
-    if !resource_path.exists() {
-        return Err(format!(
-            "Hjälpprogrammet för OCR saknas på sökvägen: {:?}. Kontrollera att det har kompilerats.",
-            resource_path
-        ));
+    // Om filen inte redan ligger där, eller om vi vill säkerställa att den är uppdaterad, skriv ut den
+    if !helper_path.exists() {
+        fs::write(&helper_path, OCR_HELPER_BYTES)
+            .map_err(|e| format!("Kunde inte skriva OCR-hjälpprogram till temp-katalog: {}", e))?;
+
+        // Om vi kör på macOS (Unix), se till att sätta exekveringsrättigheter (+x)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(&helper_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755); // Läsa/skriva/exekvera för ägaren, läsa/exekvera för andra
+                let _ = fs::set_permissions(&helper_path, perms);
+            }
+        }
     }
 
     // Kör programmet som en subprocess
-    let output = Command::new(&resource_path)
+    let output = Command::new(&helper_path)
         .arg(image_path)
         .output()
-        .map_err(|e| format!("Misslyckades att starta hjälpprogrammet {:?}: {}", resource_path, e))?;
+        .map_err(|e| format!("Misslyckades att starta hjälpprogrammet {:?}: {}", helper_path, e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
