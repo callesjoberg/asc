@@ -50,10 +50,14 @@ fn list_monitors() -> Result<Vec<capture::MonitorInfo>, String> {
 
 #[tauri::command]
 fn select_folder() -> Option<String> {
-    rfd::FileDialog::new()
-        .set_title("Välj målmapp för skärmklipp")
-        .pick_folder()
-        .map(|p| p.to_string_lossy().to_string())
+    std::thread::spawn(|| {
+        rfd::FileDialog::new()
+            .set_title("Välj målmapp för skärmklipp")
+            .pick_folder()
+            .map(|p| p.to_string_lossy().to_string())
+    })
+    .join()
+    .unwrap_or(None)
 }
 
 #[tauri::command]
