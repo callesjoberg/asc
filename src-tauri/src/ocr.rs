@@ -1,6 +1,5 @@
 use std::fs;
 use std::env;
-use std::path::PathBuf;
 use std::process::Command;
 use tauri::AppHandle;
 
@@ -15,7 +14,7 @@ const OCR_HELPER_BYTES: &[u8] = include_bytes!("../resources/ocr-helper-macos");
 const OCR_HELPER_BYTES: &[u8] = &[];
 
 /// Utför OCR på en bildfil genom att anropa det inbäddade hjälpprogrammet.
-pub fn run_ocr(app_handle: &AppHandle, image_path: &str) -> Result<String, String> {
+pub fn run_ocr(_app_handle: &AppHandle, image_path: &str) -> Result<String, String> {
     let binary_name = if cfg!(target_os = "windows") {
         "ocr-helper-win.exe"
     } else if cfg!(target_os = "macos") {
