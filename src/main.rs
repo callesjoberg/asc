@@ -1,16 +1,18 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod analysis;
 mod capture;
 mod ocr;
 
 use chrono::Local;
 use eframe::egui;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-#[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 struct LogItem {
     timestamp: String,
     pixel_diff: f64,
@@ -110,6 +112,14 @@ impl Default for AscApp {
 }
 
 impl AscApp {
+    fn export_analysis(&self) -> Result<(), String> {
+        if self.save_dir.is_empty() {
+            return Ok(());
+        }
+
+        write_analysis(Path::new(&self.save_dir), &self.logs)
+    }
+
     fn refresh_sources(&mut self) {
         if let Ok(w) = capture::list_windows() {
             self.windows = w;
@@ -241,17 +251,16 @@ impl AscApp {
                             }
                         }
 
-                        let is_changed = if prev_img.is_some() {
-                            if enable_ocr {
-                                prev_ocr
-                                    .as_ref()
-                                    .is_some_and(|previous| ocr_text.trim() != previous.trim())
-                            } else {
-                                diff >= threshold
-                            }
-                        } else {
-                            false
-                        };
+                        let ocr_changed = enable_ocr
+                            && prev_ocr
+                                .as_ref()
+                                .is_some_and(|previous| ocr_text.trim() != previous.trim());
+                        let is_changed = analysis::change_detected(
+                            prev_img.is_some(),
+                            diff,
+                            threshold,
+                            ocr_changed,
+                        );
 
                         prev_img = Some(img.clone());
                         if enable_ocr {
@@ -412,17 +421,16 @@ impl AscApp {
                             }
                         }
 
-                        let is_changed = if prev_img.is_some() {
-                            if enable_ocr {
-                                prev_ocr
-                                    .as_ref()
-                                    .is_some_and(|previous| ocr_text.trim() != previous.trim())
-                            } else {
-                                diff >= threshold
-                            }
-                        } else {
-                            false
-                        };
+                        let ocr_changed = enable_ocr
+                            && prev_ocr
+                                .as_ref()
+                                .is_some_and(|previous| ocr_text.trim() != previous.trim());
+                        let is_changed = analysis::change_detected(
+                            prev_img.is_some(),
+                            diff,
+                            threshold,
+                            ocr_changed,
+                        );
 
                         prev_img = Some(img.clone());
                         if enable_ocr {
@@ -473,6 +481,7 @@ impl eframe::App for AscApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Kontrollera om vi tagit emot meddelanden från bakgrundstråden
         let mut should_clear_receiver = false;
+        let mut analysis_changed = false;
         if let Some(ref receiver) = self.log_receiver {
             while let Ok(msg) = receiver.try_recv() {
                 match msg {
@@ -483,6 +492,7 @@ impl eframe::App for AscApp {
                         }
                         self.diffs_history.push(item.pixel_diff);
                         self.logs.push(item);
+                        analysis_changed = true;
                     }
                     WorkerMessage::Preview(rgba_bytes, w, h) => {
                         let color_image =
@@ -507,6 +517,11 @@ impl eframe::App for AscApp {
         }
         if should_clear_receiver {
             self.log_receiver = None;
+        }
+        if analysis_changed {
+            if let Err(error) = self.export_analysis() {
+                self.status_text = format!("Exportfel: {error}");
+            }
         }
 
         // Definiera det övergripande gränssnittet
@@ -606,7 +621,7 @@ impl eframe::App for AscApp {
 
                     // Spara i mapp (RFD Dialog)
                     ui.label(if self.mode == "live" {
-                        "Spara skärmklipp i mapp (valfritt):"
+                        "Spara skärmklipp och analys i mapp (valfritt):"
                     } else {
                         "Analysmapp (Bilder):"
                     });
@@ -620,6 +635,9 @@ impl eframe::App for AscApp {
                             }
                         }
                     });
+                    if !self.save_dir.is_empty() {
+                        ui.small("Analysen sparas som asc-analysis.csv och asc-analysis.json");
+                    }
                     ui.add_space(5.0);
 
                     // Parametrar
@@ -861,6 +879,9 @@ impl eframe::App for AscApp {
                             self.diffs_history.clear();
                             self.total_captures = 0;
                             self.total_changes = 0;
+                            if let Err(error) = self.export_analysis() {
+                                self.status_text = format!("Exportfel: {error}");
+                            }
                         }
                     });
 
@@ -942,6 +963,38 @@ impl eframe::App for AscApp {
     }
 }
 
+fn csv_field(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn write_analysis(directory: &Path, logs: &[LogItem]) -> Result<(), String> {
+    if !directory.is_dir() {
+        return Err("analysmappen finns inte".to_string());
+    }
+
+    let json = serde_json::to_vec_pretty(logs)
+        .map_err(|error| format!("kunde inte skapa JSON: {error}"))?;
+    fs::write(directory.join("asc-analysis.json"), json)
+        .map_err(|error| format!("kunde inte skriva asc-analysis.json: {error}"))?;
+
+    let mut csv = String::from("timestamp,file_name,pixel_diff_percent,ocr_text,is_changed\n");
+    for item in logs {
+        let _ = writeln!(
+            csv,
+            "{},{},{:.6},{},{}",
+            csv_field(&item.timestamp),
+            csv_field(&item.file_name),
+            item.pixel_diff * 100.0,
+            csv_field(&item.ocr_text),
+            item.is_changed
+        );
+    }
+    fs::write(directory.join("asc-analysis.csv"), csv)
+        .map_err(|error| format!("kunde inte skriva asc-analysis.csv: {error}"))?;
+
+    Ok(())
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -955,4 +1008,46 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_cc| Ok(Box::new(AscApp::default()))),
     )
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::{csv_field, write_analysis, LogItem};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn csv_fields_escape_quotes() {
+        assert_eq!(csv_field("text, \"citat\""), "\"text, \"\"citat\"\"\"");
+    }
+
+    #[test]
+    fn analysis_is_written_as_csv_and_json() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("systemklockan ska vara efter Unix-epoken")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("asc-export-test-{}-{unique}", std::process::id()));
+        fs::create_dir(&directory).expect("testmappen ska kunna skapas");
+        let logs = vec![LogItem {
+            timestamp: "12:34:56".to_string(),
+            pixel_diff: 0.0125,
+            ocr_text: "Rad 1, \"test\"".to_string(),
+            is_changed: true,
+            file_name: "capture.png".to_string(),
+        }];
+
+        write_analysis(&directory, &logs).expect("analysen ska kunna exporteras");
+
+        let csv =
+            fs::read_to_string(directory.join("asc-analysis.csv")).expect("CSV-filen ska finnas");
+        let json =
+            fs::read_to_string(directory.join("asc-analysis.json")).expect("JSON-filen ska finnas");
+        assert!(csv.contains("1.250000"));
+        assert!(csv.contains("\"Rad 1, \"\"test\"\"\""));
+        assert!(json.contains("\"is_changed\": true"));
+
+        fs::remove_dir_all(directory).expect("testmappen ska kunna tas bort");
+    }
 }

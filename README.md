@@ -10,6 +10,7 @@ ASC är en plattformsoberoende skrivbordsapp för att övervaka skärmar eller f
 - Inbyggd OCR på macOS och Windows
 - Efterhandsanalys av PNG- och JPEG-bilder i en mapp
 - Förhandsgranskning, statistik, graf och händelselogg
+- Automatisk export till `asc-analysis.csv` och `asc-analysis.json`
 
 ## Utveckling
 
@@ -29,6 +30,8 @@ cargo build --release
 ```
 
 På macOS måste appen få behörighet för skärminspelning i Systeminställningar. OCR-hjälpprogrammet i `resources/` bäddas in i appbinären. Windows-hjälpprogrammet byggs automatiskt i GitHub Actions före Rust-bygget.
+
+Den första bilden används som referens. Från och med bild två markeras en förändring när RGB-skillnaden når pixeltröskeln eller när OCR-texten ändras. Analysfilerna uppdateras automatiskt i den valda mappen.
 
 ## Release
 

@@ -47,7 +47,7 @@ jobs:
           fi
 
           gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --title "ASC Screen Analyzer v$VERSION" --draft \
+            gh release create "$TAG" --title "ASC Screen Analyzer v$VERSION" \
               --notes "Automatisk byggnation av infödda Rust-binärer (.exe och .tar.gz)." || true
 
           if [ "${{ matrix.platform }}" = "windows-latest" ]; then
