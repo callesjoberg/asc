@@ -27,27 +27,22 @@ pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
     let windows = Window::all().map_err(|e| format!("Kunde inte hämta fönster: {}", e))?;
     let mut list = Vec::new();
     for w in windows {
-        // Ignorera minimerade fönster eller fönster utan titel för att hålla listan ren
-        if w.is_minimized().unwrap_or(false) {
-            continue;
-        }
-        let title = match w.title() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if title.trim().is_empty() {
-            continue;
-        }
-        
-        let app_name = w.app_name().unwrap_or_else(|_| "Okänd App".to_string());
         let id = match w.id() {
             Ok(id) => id,
             Err(_) => continue,
         };
         
+        let title = w.title().unwrap_or_default();
+        let app_name = w.app_name().unwrap_or_else(|_| "Okänd App".to_string());
+        
+        // Hoppa bara över om både titel och app-namn saknas helt
+        if title.trim().is_empty() && app_name.trim().is_empty() {
+            continue;
+        }
+        
         list.push(WindowInfo {
             id,
-            title,
+            title: if title.trim().is_empty() { "Namnlöst fönster".to_string() } else { title },
             app_name,
             x: w.x().unwrap_or(0),
             y: w.y().unwrap_or(0),
