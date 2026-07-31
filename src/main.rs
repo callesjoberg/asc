@@ -18,9 +18,19 @@ use std::time::{Duration, Instant};
 struct LogItem {
     timestamp: String,
     pixel_diff: f64,
+    changed_pixels: u64,
     ocr_text: String,
     is_changed: bool,
     file_name: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct KeywordColorResult {
+    timestamp: String,
+    file_name: String,
+    keyword: String,
+    color: analysis::IndicatorColor,
+    ocr_text: String,
 }
 
 enum ControlMessage {
@@ -31,6 +41,7 @@ enum WorkerMessage {
     Log(LogItem),
     Preview(Vec<u8>, usize, usize), // RGBA-pixlar, bredd, höjd
     Error(String),
+    KeywordColor(KeywordColorResult),
     OfflineDone(String),
 }
 
@@ -44,6 +55,9 @@ struct AscApp {
     save_dir: String,
     interval_secs: u64,
     threshold_pct: f64,
+    detect_small_changes: bool,
+    small_change_min_pixels: u64,
+    small_change_color_delta: u8,
     enable_crop: bool,
     crop_x: u32,
     crop_y: u32,
@@ -55,6 +69,21 @@ struct AscApp {
     ocr_y: u32,
     ocr_w: u32,
     ocr_h: u32,
+    enable_keyword_color: bool,
+    keyword: String,
+    keyword_delay_frames: u32,
+    keyword_rising_edge_only: bool,
+    indicator_x: u32,
+    indicator_y: u32,
+    indicator_w: u32,
+    indicator_h: u32,
+    indicator_color_delta: u8,
+    indicator_min_pixels: u64,
+    ocr_regions: Vec<(u32, u32, u32, u32)>,
+    measurement_regions: Vec<(u32, u32, u32, u32)>,
+    region_editor_active: bool,
+    region_editor_kind: String,
+    region_drag_start: Option<egui::Pos2>,
 
     // Status och historik
     is_running: bool,
@@ -63,6 +92,7 @@ struct AscApp {
     diffs_history: Vec<f64>,
     total_captures: usize,
     total_changes: usize,
+    keyword_results: Vec<KeywordColorResult>,
     export_pending: bool,
     last_export_at: Instant,
 
@@ -91,6 +121,7 @@ struct AscApp {
     mouse_last_activity: String,
     mouse_moves: u64,
     mouse_clicks: u64,
+    mouse_typed_words: u64,
     mouse_interval_min: u64,
     mouse_interval_max: u64,
     mouse_pause_chance: f64,
@@ -98,6 +129,11 @@ struct AscApp {
     mouse_pause_max: u64,
     mouse_click_enabled: bool,
     mouse_click_every: u32,
+    mouse_typing_enabled: bool,
+    mouse_typing_chance: f64,
+    mouse_typing_words: String,
+    mouse_typing_min_words: u32,
+    mouse_typing_max_words: u32,
     mouse_selected_windows: HashSet<u32>,
     mouse_stop_after_enabled: bool,
     mouse_stop_after_minutes: u64,
@@ -115,6 +151,9 @@ impl Default for AscApp {
             save_dir: String::new(),
             interval_secs: 5,
             threshold_pct: 1.0,
+            detect_small_changes: true,
+            small_change_min_pixels: 5,
+            small_change_color_delta: 24,
             enable_crop: false,
             crop_x: 0,
             crop_y: 0,
@@ -126,12 +165,28 @@ impl Default for AscApp {
             ocr_y: 0,
             ocr_w: 300,
             ocr_h: 50,
+            enable_keyword_color: false,
+            keyword: "öppet".to_string(),
+            keyword_delay_frames: 0,
+            keyword_rising_edge_only: true,
+            indicator_x: 0,
+            indicator_y: 0,
+            indicator_w: 20,
+            indicator_h: 20,
+            indicator_color_delta: 24,
+            indicator_min_pixels: 5,
+            ocr_regions: Vec::new(),
+            measurement_regions: Vec::new(),
+            region_editor_active: false,
+            region_editor_kind: "screenshot".to_string(),
+            region_drag_start: None,
             is_running: false,
             status_text: "Klar att starta".to_string(),
             logs: Vec::new(),
             diffs_history: Vec::new(),
             total_captures: 0,
             total_changes: 0,
+            keyword_results: Vec::new(),
             export_pending: false,
             last_export_at: Instant::now(),
             windows: Vec::new(),
@@ -152,6 +207,7 @@ impl Default for AscApp {
             mouse_last_activity: "Ingen aktivitet ännu.".to_string(),
             mouse_moves: 0,
             mouse_clicks: 0,
+            mouse_typed_words: 0,
             mouse_interval_min: 5,
             mouse_interval_max: 15,
             mouse_pause_chance: 20.0,
@@ -159,6 +215,11 @@ impl Default for AscApp {
             mouse_pause_max: 30,
             mouse_click_enabled: false,
             mouse_click_every: 3,
+            mouse_typing_enabled: false,
+            mouse_typing_chance: 30.0,
+            mouse_typing_words: "hej,anteckning,test,grön,röd,grå".to_string(),
+            mouse_typing_min_words: 1,
+            mouse_typing_max_words: 3,
             mouse_selected_windows: HashSet::new(),
             mouse_stop_after_enabled: true,
             mouse_stop_after_minutes: 60,
@@ -176,7 +237,7 @@ impl AscApp {
             return Ok(());
         }
 
-        write_analysis(Path::new(&self.save_dir), &self.logs)
+        write_analysis(Path::new(&self.save_dir), &self.logs, &self.keyword_results)
     }
 
     fn refresh_sources(&mut self) {
@@ -221,11 +282,17 @@ impl AscApp {
             self.status_text = "Fel: Den valda målmappen finns inte.".to_string();
             return;
         }
+        if self.enable_keyword_color && (!self.enable_ocr || self.keyword.trim().is_empty()) {
+            self.status_text =
+                "Fel: Aktivera OCR och ange ett sökord för ord-/färganalysen.".to_string();
+            return;
+        }
 
         self.logs.clear();
         self.diffs_history.clear();
         self.total_captures = 0;
         self.total_changes = 0;
+        self.keyword_results.clear();
         self.export_pending = false;
         self.preview_texture = None;
         self.preview_size = None;
@@ -249,6 +316,9 @@ impl AscApp {
         let save_dir = self.save_dir.clone();
         let interval_secs = self.interval_secs;
         let threshold = self.threshold_pct / 100.0;
+        let detect_small_changes = self.detect_small_changes;
+        let small_change_min_pixels = self.small_change_min_pixels;
+        let small_change_color_delta = self.small_change_color_delta;
 
         let crop_area = if self.enable_crop {
             Some((self.crop_x, self.crop_y, self.crop_w, self.crop_h))
@@ -262,10 +332,32 @@ impl AscApp {
         } else {
             None
         };
+        let enable_keyword_color = self.enable_keyword_color;
+        let keyword = self.keyword.trim().to_string();
+        let keyword_delay_frames = self.keyword_delay_frames;
+        let keyword_rising_edge_only = self.keyword_rising_edge_only;
+        let indicator_area = (
+            self.indicator_x,
+            self.indicator_y,
+            self.indicator_w,
+            self.indicator_h,
+        );
+        let indicator_color_delta = self.indicator_color_delta;
+        let indicator_min_pixels = self.indicator_min_pixels;
+        let ocr_regions = self.ocr_regions.clone();
+        let measurement_regions = self.measurement_regions.clone();
 
         std::thread::spawn(move || {
             let mut prev_img: Option<image::DynamicImage> = None;
+            let mut prev_source_img: Option<image::DynamicImage> = None;
             let mut prev_ocr: Option<String> = None;
+            let mut keyword_tracker = enable_keyword_color.then(|| {
+                analysis::KeywordTracker::new(
+                    &keyword,
+                    keyword_delay_frames,
+                    keyword_rising_edge_only,
+                )
+            });
             loop {
                 // Kontrollera om vi ska stoppa tråden
                 if let Ok(ControlMessage::Stop) = control_rx.try_recv() {
@@ -273,8 +365,13 @@ impl AscApp {
                 }
 
                 // Ta skärmklipp
-                match capture::capture_source(&source_type, source_id, crop_area) {
-                    Ok(img) => {
+                match capture::capture_source(&source_type, source_id, None) {
+                    Ok(source_img) => {
+                        let img = if let Some(area) = crop_area {
+                            capture::crop_image(&source_img, area)
+                        } else {
+                            source_img.clone()
+                        };
                         let timestamp = Local::now().format("%H:%M:%S").to_string();
                         let file_timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
 
@@ -290,45 +387,92 @@ impl AscApp {
 
                         // Beräkna bildskillnad
                         let mut diff = 0.0;
+                        let mut changed_pixels = 0;
                         if let Some(ref p_img) = prev_img {
-                            diff = analysis::compare_images(p_img, &img);
+                            let difference = if measurement_regions.is_empty() {
+                                analysis::analyze_images(p_img, &img, small_change_color_delta)
+                            } else {
+                                analysis::analyze_regions(
+                                    prev_source_img.as_ref().unwrap_or(p_img),
+                                    &source_img,
+                                    &measurement_regions,
+                                    small_change_color_delta,
+                                )
+                            };
+                            diff = difference.average;
+                            changed_pixels = difference.changed_pixels;
                         }
 
                         // OCR (Textigenkänning)
                         let mut ocr_text = String::new();
                         if enable_ocr {
-                            let ocr_img = if let Some(area) = ocr_area {
-                                capture::crop_image(&img, area)
+                            let ocr_images = if ocr_regions.is_empty() {
+                                vec![if let Some(area) = ocr_area {
+                                    capture::crop_image(&img, area)
+                                } else {
+                                    img.clone()
+                                }]
                             } else {
-                                img.clone()
+                                ocr_regions
+                                    .iter()
+                                    .map(|&area| capture::crop_image(&source_img, area))
+                                    .collect::<Vec<_>>()
                             };
-
-                            let temp_path = std::env::temp_dir().join(format!(
-                                "asc_ocr_{}_{}.png",
-                                std::process::id(),
-                                file_timestamp
-                            ));
-                            if ocr_img.save(&temp_path).is_ok() {
-                                match ocr::run_ocr(&temp_path.to_string_lossy()) {
-                                    Ok(text) => ocr_text = text,
-                                    Err(error) => ocr_text = format!("OCR-fel: {error}"),
+                            let mut texts = Vec::new();
+                            for (region_index, ocr_img) in ocr_images.into_iter().enumerate() {
+                                let temp_path = std::env::temp_dir().join(format!(
+                                    "asc_ocr_{}_{}_{}.png",
+                                    std::process::id(),
+                                    file_timestamp,
+                                    region_index
+                                ));
+                                if ocr_img.save(&temp_path).is_ok() {
+                                    match ocr::run_ocr(&temp_path.to_string_lossy()) {
+                                        Ok(text) => texts.push(text),
+                                        Err(error) => texts.push(format!("OCR-fel: {error}")),
+                                    }
+                                    let _ = fs::remove_file(temp_path);
                                 }
-                                let _ = fs::remove_file(temp_path);
                             }
+                            ocr_text = texts.join("\n");
                         }
 
                         let ocr_changed = enable_ocr
                             && prev_ocr
                                 .as_ref()
                                 .is_some_and(|previous| ocr_text.trim() != previous.trim());
+                        if let Some(tracker) = keyword_tracker.as_mut() {
+                            let due_results = tracker.advance(&ocr_text);
+                            if due_results > 0 {
+                                let color = analysis::classify_indicator(
+                                    &source_img,
+                                    indicator_area,
+                                    indicator_color_delta,
+                                    indicator_min_pixels,
+                                );
+                                for _ in 0..due_results {
+                                    let _ = log_tx.send(WorkerMessage::KeywordColor(
+                                        KeywordColorResult {
+                                            timestamp: timestamp.clone(),
+                                            file_name: file_name.clone(),
+                                            keyword: keyword.clone(),
+                                            color,
+                                            ocr_text: ocr_text.clone(),
+                                        },
+                                    ));
+                                }
+                            }
+                        }
                         let is_changed = analysis::change_detected(
                             prev_img.is_some(),
                             diff,
                             threshold,
+                            detect_small_changes && changed_pixels >= small_change_min_pixels,
                             ocr_changed,
                         );
 
                         prev_img = Some(img.clone());
+                        prev_source_img = Some(source_img);
                         if enable_ocr {
                             prev_ocr = Some(ocr_text.clone());
                         }
@@ -337,6 +481,7 @@ impl AscApp {
                         let log_item = LogItem {
                             timestamp,
                             pixel_diff: diff,
+                            changed_pixels,
                             ocr_text,
                             is_changed,
                             file_name,
@@ -379,9 +524,43 @@ impl AscApp {
         self.control_sender = None;
     }
 
+    fn apply_live_settings(&mut self, ctx: egui::Context) {
+        let logs = std::mem::take(&mut self.logs);
+        let history = std::mem::take(&mut self.diffs_history);
+        let keyword_results = std::mem::take(&mut self.keyword_results);
+        let total_captures = self.total_captures;
+        let total_changes = self.total_changes;
+
+        if let Some(sender) = self.control_sender.as_ref() {
+            let _ = sender.send(ControlMessage::Stop);
+        }
+        self.log_receiver = None;
+        self.control_sender = None;
+        self.is_running = false;
+        self.start_monitoring(ctx);
+
+        let restart_status = self.status_text.clone();
+        self.logs = logs;
+        self.diffs_history = history;
+        self.keyword_results = keyword_results;
+        self.total_captures = total_captures;
+        self.total_changes = total_changes;
+        if self.is_running {
+            self.status_text = "Övervakar med uppdaterade inställningar…".to_string();
+            self.export_pending = true;
+        } else {
+            self.status_text = restart_status;
+        }
+    }
+
     fn start_offline_analysis(&mut self, ctx: egui::Context) {
         if self.save_dir.is_empty() || !Path::new(&self.save_dir).is_dir() {
             self.status_text = "Fel: Välj en befintlig analysmapp först.".to_string();
+            return;
+        }
+        if self.enable_keyword_color && (!self.enable_ocr || self.keyword.trim().is_empty()) {
+            self.status_text =
+                "Fel: Aktivera OCR och ange ett sökord för ord-/färganalysen.".to_string();
             return;
         }
 
@@ -389,6 +568,7 @@ impl AscApp {
         self.diffs_history.clear();
         self.total_captures = 0;
         self.total_changes = 0;
+        self.keyword_results.clear();
         self.export_pending = false;
         self.preview_texture = None;
         self.preview_size = None;
@@ -406,6 +586,9 @@ impl AscApp {
 
         let save_dir = self.save_dir.clone();
         let threshold = self.threshold_pct / 100.0;
+        let detect_small_changes = self.detect_small_changes;
+        let small_change_min_pixels = self.small_change_min_pixels;
+        let small_change_color_delta = self.small_change_color_delta;
         let crop_area = if self.enable_crop {
             Some((self.crop_x, self.crop_y, self.crop_w, self.crop_h))
         } else {
@@ -417,6 +600,20 @@ impl AscApp {
         } else {
             None
         };
+        let enable_keyword_color = self.enable_keyword_color;
+        let keyword = self.keyword.trim().to_string();
+        let keyword_delay_frames = self.keyword_delay_frames;
+        let keyword_rising_edge_only = self.keyword_rising_edge_only;
+        let indicator_area = (
+            self.indicator_x,
+            self.indicator_y,
+            self.indicator_w,
+            self.indicator_h,
+        );
+        let indicator_color_delta = self.indicator_color_delta;
+        let indicator_min_pixels = self.indicator_min_pixels;
+        let ocr_regions = self.ocr_regions.clone();
+        let measurement_regions = self.measurement_regions.clone();
 
         std::thread::spawn(move || {
             let dir_path = Path::new(&save_dir);
@@ -449,14 +646,23 @@ impl AscApp {
             }
 
             let mut prev_img: Option<image::DynamicImage> = None;
+            let mut prev_source_img: Option<image::DynamicImage> = None;
             let mut prev_ocr: Option<String> = None;
+            let mut keyword_tracker = enable_keyword_color.then(|| {
+                analysis::KeywordTracker::new(
+                    &keyword,
+                    keyword_delay_frames,
+                    keyword_rising_edge_only,
+                )
+            });
             for (idx, path) in entries.iter().enumerate() {
                 match image::open(path) {
                     Ok(original_img) => {
+                        let source_img = original_img;
                         let img = if let Some(area) = crop_area {
-                            capture::crop_image(&original_img, area)
+                            capture::crop_image(&source_img, area)
                         } else {
-                            original_img
+                            source_img.clone()
                         };
                         let file_name = path
                             .file_name()
@@ -467,45 +673,92 @@ impl AscApp {
 
                         // Beräkna bildskillnad
                         let mut diff = 0.0;
+                        let mut changed_pixels = 0;
                         if let Some(ref p_img) = prev_img {
-                            diff = analysis::compare_images(p_img, &img);
+                            let difference = if measurement_regions.is_empty() {
+                                analysis::analyze_images(p_img, &img, small_change_color_delta)
+                            } else {
+                                analysis::analyze_regions(
+                                    prev_source_img.as_ref().unwrap_or(p_img),
+                                    &source_img,
+                                    &measurement_regions,
+                                    small_change_color_delta,
+                                )
+                            };
+                            diff = difference.average;
+                            changed_pixels = difference.changed_pixels;
                         }
 
                         // OCR (Textigenkänning)
                         let mut ocr_text = String::new();
                         if enable_ocr {
-                            let ocr_img = if let Some(area) = ocr_area {
-                                capture::crop_image(&img, area)
+                            let ocr_images = if ocr_regions.is_empty() {
+                                vec![if let Some(area) = ocr_area {
+                                    capture::crop_image(&img, area)
+                                } else {
+                                    img.clone()
+                                }]
                             } else {
-                                img.clone()
+                                ocr_regions
+                                    .iter()
+                                    .map(|&area| capture::crop_image(&source_img, area))
+                                    .collect::<Vec<_>>()
                             };
-
-                            let temp_path = std::env::temp_dir().join(format!(
-                                "asc_ocr_{}_{}.png",
-                                std::process::id(),
-                                idx
-                            ));
-                            if ocr_img.save(&temp_path).is_ok() {
-                                match ocr::run_ocr(&temp_path.to_string_lossy()) {
-                                    Ok(text) => ocr_text = text,
-                                    Err(error) => ocr_text = format!("OCR-fel: {error}"),
+                            let mut texts = Vec::new();
+                            for (region_index, ocr_img) in ocr_images.into_iter().enumerate() {
+                                let temp_path = std::env::temp_dir().join(format!(
+                                    "asc_ocr_{}_{}_{}.png",
+                                    std::process::id(),
+                                    idx,
+                                    region_index
+                                ));
+                                if ocr_img.save(&temp_path).is_ok() {
+                                    match ocr::run_ocr(&temp_path.to_string_lossy()) {
+                                        Ok(text) => texts.push(text),
+                                        Err(error) => texts.push(format!("OCR-fel: {error}")),
+                                    }
+                                    let _ = fs::remove_file(temp_path);
                                 }
-                                let _ = fs::remove_file(temp_path);
                             }
+                            ocr_text = texts.join("\n");
                         }
 
                         let ocr_changed = enable_ocr
                             && prev_ocr
                                 .as_ref()
                                 .is_some_and(|previous| ocr_text.trim() != previous.trim());
+                        if let Some(tracker) = keyword_tracker.as_mut() {
+                            let due_results = tracker.advance(&ocr_text);
+                            if due_results > 0 {
+                                let color = analysis::classify_indicator(
+                                    &source_img,
+                                    indicator_area,
+                                    indicator_color_delta,
+                                    indicator_min_pixels,
+                                );
+                                for _ in 0..due_results {
+                                    let _ = log_tx.send(WorkerMessage::KeywordColor(
+                                        KeywordColorResult {
+                                            timestamp: timestamp.clone(),
+                                            file_name: file_name.clone(),
+                                            keyword: keyword.clone(),
+                                            color,
+                                            ocr_text: ocr_text.clone(),
+                                        },
+                                    ));
+                                }
+                            }
+                        }
                         let is_changed = analysis::change_detected(
                             prev_img.is_some(),
                             diff,
                             threshold,
+                            detect_small_changes && changed_pixels >= small_change_min_pixels,
                             ocr_changed,
                         );
 
                         prev_img = Some(img.clone());
+                        prev_source_img = Some(source_img);
                         if enable_ocr {
                             prev_ocr = Some(ocr_text.clone());
                         }
@@ -514,6 +767,7 @@ impl AscApp {
                         let log_item = LogItem {
                             timestamp,
                             pixel_diff: diff,
+                            changed_pixels,
                             ocr_text,
                             is_changed,
                             file_name,
@@ -563,8 +817,23 @@ impl AscApp {
     }
 
     fn start_mouse_simulation(&mut self, ctx: &egui::Context) {
+        if self.mouse_typing_enabled && !self.mouse_click_enabled {
+            self.mouse_status = "Aktivera fönsterklick för att kunna skriva ord.".to_string();
+            return;
+        }
         if self.mouse_click_enabled && self.mouse_selected_windows.is_empty() {
             self.mouse_status = "Välj minst ett tillåtet fönster eller stäng av klick.".to_string();
+            return;
+        }
+        let typing_words = self
+            .mouse_typing_words
+            .split(',')
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if self.mouse_typing_enabled && typing_words.is_empty() {
+            self.mouse_status = "Ange minst ett ord för slumpmässig textinmatning.".to_string();
             return;
         }
 
@@ -577,6 +846,11 @@ impl AscApp {
             click_enabled: self.mouse_click_enabled,
             click_every: self.mouse_click_every.max(1),
             window_ids: self.mouse_selected_windows.iter().copied().collect(),
+            typing_enabled: self.mouse_typing_enabled,
+            typing_chance: self.mouse_typing_chance / 100.0,
+            typing_words,
+            typing_min_words: self.mouse_typing_min_words,
+            typing_max_words: self.mouse_typing_max_words,
             stop_after: self
                 .mouse_stop_after_enabled
                 .then(|| Duration::from_secs(self.mouse_stop_after_minutes.max(1) * 60)),
@@ -588,6 +862,7 @@ impl AscApp {
         self.mouse_running = true;
         self.mouse_moves = 0;
         self.mouse_clicks = 0;
+        self.mouse_typed_words = 0;
         self.mouse_last_activity = "Väntar på första rörelsen…".to_string();
         self.mouse_status = "Musautomatisering körs.".to_string();
         std::thread::spawn(move || mouse_sim::run(config, control_rx, event_tx));
@@ -623,6 +898,8 @@ impl AscApp {
                 ui.label(format!("Rörelser: {}", self.mouse_moves));
                 ui.separator();
                 ui.label(format!("Klick: {}", self.mouse_clicks));
+                ui.separator();
+                ui.label(format!("Skrivna ord: {}", self.mouse_typed_words));
             });
             ui.small(format!("Senast: {}", self.mouse_last_activity));
             ui.separator();
@@ -671,7 +948,7 @@ impl AscApp {
                     ui.heading("Fönsterklick");
                     ui.checkbox(
                         &mut self.mouse_click_enabled,
-                        "Klicka på titelraden i särskilt valda fönster",
+                        "Klicka i särskilt valda fönster",
                     );
                     ui.small(
                         "Klick är avstängt som standard. ASC klickar aldrig i ett omarkerat fönster.",
@@ -722,6 +999,47 @@ impl AscApp {
                                     }
                                 }
                             });
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.checkbox(
+                            &mut self.mouse_typing_enabled,
+                            "Skriv ibland slumpmässiga ord efter ett fönsterklick",
+                        );
+                        if self.mouse_typing_enabled {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                "Observera: detta ändrar innehållet i det valda programmet.",
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label("Skrivchans:");
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.mouse_typing_chance,
+                                        1.0..=100.0,
+                                    )
+                                    .suffix(" % av klicken"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Antal ord:");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.mouse_typing_min_words)
+                                        .range(1..=20)
+                                        .suffix(" min"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut self.mouse_typing_max_words)
+                                        .range(1..=20)
+                                        .suffix(" max"),
+                                );
+                            });
+                            ui.label("Ordlista, separerad med kommatecken:");
+                            ui.text_edit_singleline(&mut self.mouse_typing_words);
+                            ui.small(
+                                "Vid skrivning klickar ASC i fönstrets innehållsyta i stället för titelraden.",
+                            );
+                        }
                     }
 
                     ui.add_space(12.0);
@@ -839,6 +1157,50 @@ impl AscApp {
         }
     }
 
+    fn start_region_editor(&mut self, ctx: &egui::Context) {
+        let result = if self.mode == "live" {
+            capture::capture_source(&self.source_type, self.selected_source_id, None)
+        } else {
+            let mut paths = match fs::read_dir(Path::new(&self.save_dir)) {
+                Ok(entries) => entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.extension().is_some_and(|extension| {
+                            matches!(
+                                extension.to_string_lossy().to_ascii_lowercase().as_str(),
+                                "png" | "jpg" | "jpeg"
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    self.status_text = format!("Kunde inte läsa analysmappen: {error}");
+                    return;
+                }
+            };
+            paths.sort();
+            paths
+                .first()
+                .ok_or_else(|| "Inga bilder hittades i analysmappen.".to_string())
+                .and_then(|path| {
+                    image::open(path)
+                        .map_err(|error| format!("Kunde inte öppna {}: {error}", path.display()))
+                })
+        };
+
+        match result {
+            Ok(image) => {
+                self.display_preview_image(image, "Områdesväljare".to_string(), ctx);
+                self.region_editor_active = true;
+                self.region_drag_start = None;
+                self.status_text =
+                    "Dra områden direkt i förhandsvisningen och tryck sedan Klar.".to_string();
+            }
+            Err(error) => self.status_text = format!("Områdesväljarfel: {error}"),
+        }
+    }
+
     fn show_logged_capture(&mut self, log_index: usize, ctx: &egui::Context) {
         let Some(file_name) = self.logs.get(log_index).map(|log| log.file_name.clone()) else {
             return;
@@ -875,6 +1237,7 @@ impl AscApp {
             ui.weak("Klicka på tiden för att visa klippet");
             if ui.button("Rensa logg").clicked() {
                 self.logs.clear();
+                self.keyword_results.clear();
                 self.diffs_history.clear();
                 self.total_captures = 0;
                 self.total_changes = 0;
@@ -886,15 +1249,26 @@ impl AscApp {
 
         let spacing = ui.spacing().item_spacing.x;
         let timestamp_width = 68.0;
-        let diff_width = 58.0;
+        let diff_width = 72.0;
+        let pixels_width = 68.0;
         let status_width = 88.0;
-        let ocr_width =
-            (ui.available_width() - timestamp_width - diff_width - status_width - spacing * 3.0)
-                .max(60.0);
-        let widths = [timestamp_width, diff_width, ocr_width, status_width];
+        let ocr_width = (ui.available_width()
+            - timestamp_width
+            - diff_width
+            - pixels_width
+            - status_width
+            - spacing * 4.0)
+            .max(60.0);
+        let widths = [
+            timestamp_width,
+            diff_width,
+            pixels_width,
+            ocr_width,
+            status_width,
+        ];
 
         ui.horizontal(|ui| {
-            for (label, width) in ["Tid", "Diff %", "OCR-text", "Status"]
+            for (label, width) in ["Tid", "Diff %", "Ändr. px", "OCR-text", "Status"]
                 .into_iter()
                 .zip(widths)
             {
@@ -928,10 +1302,14 @@ impl AscApp {
                         }
                         ui.add_sized(
                             [widths[1], row_height],
-                            egui::Label::new(format!("{:.2}%", log.pixel_diff * 100.0)).truncate(),
+                            egui::Label::new(format!("{:.5}%", log.pixel_diff * 100.0)).truncate(),
                         );
                         ui.add_sized(
                             [widths[2], row_height],
+                            egui::Label::new(log.changed_pixels.to_string()).truncate(),
+                        );
+                        ui.add_sized(
+                            [widths[3], row_height],
                             egui::Label::new(&log.ocr_text).truncate(),
                         )
                         .on_hover_text(&log.ocr_text);
@@ -940,7 +1318,7 @@ impl AscApp {
                         } else {
                             egui::RichText::new("Ingen ändring")
                         };
-                        ui.add_sized([widths[3], row_height], egui::Label::new(status).truncate());
+                        ui.add_sized([widths[4], row_height], egui::Label::new(status).truncate());
                     });
                 }
             },
@@ -985,8 +1363,60 @@ impl AscApp {
                     .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
             )
             .on_hover_text("Zoom relativt Anpassa-läget");
-            ui.label("Rulla för zoom · dra för panorering · dubbelklicka för Anpassa");
+            if self.region_editor_active {
+                ui.label("Rulla för zoom · dra för att markera · dubbelklicka för Anpassa");
+            } else {
+                ui.label("Rulla för zoom · dra för panorering · dubbelklicka för Anpassa");
+            }
         });
+        if self.region_editor_active {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Markera:");
+                ui.selectable_value(
+                    &mut self.region_editor_kind,
+                    "screenshot".to_string(),
+                    "Skärmklipp",
+                );
+                ui.selectable_value(
+                    &mut self.region_editor_kind,
+                    "ocr".to_string(),
+                    "OCR-område",
+                );
+                ui.selectable_value(
+                    &mut self.region_editor_kind,
+                    "measurement".to_string(),
+                    "Pixel/färg",
+                );
+                if ui.button("Ångra senaste").clicked() {
+                    match self.region_editor_kind.as_str() {
+                        "screenshot" => self.enable_crop = false,
+                        "ocr" => {
+                            self.ocr_regions.pop();
+                        }
+                        _ => {
+                            self.measurement_regions.pop();
+                        }
+                    }
+                }
+                if ui.button("Rensa alla områden").clicked() {
+                    self.enable_crop = false;
+                    self.ocr_regions.clear();
+                    self.measurement_regions.clear();
+                }
+                if ui.button("Klar").clicked() {
+                    self.region_editor_active = false;
+                    self.region_drag_start = None;
+                    self.status_text = format!(
+                        "Områden sparade: {} OCR, {} pixel/färg.",
+                        self.ocr_regions.len(),
+                        self.measurement_regions.len()
+                    );
+                }
+            });
+            ui.small(
+                "Dra med vänster musknapp för att skapa området. Zooma med hjulet; använd Anpassa för helbild.",
+            );
+        }
         ui.separator();
 
         let canvas_size = egui::vec2(
@@ -1021,7 +1451,7 @@ impl AscApp {
                 self.preview_zoom = (self.preview_zoom * (scroll * 0.0015).exp()).clamp(0.1, 8.0);
             }
         }
-        if response.dragged_by(egui::PointerButton::Primary) {
+        if !self.region_editor_active && response.dragged_by(egui::PointerButton::Primary) {
             self.preview_pan += ui.input(|input| input.pointer.delta());
         }
 
@@ -1042,8 +1472,131 @@ impl AscApp {
             egui::Color32::WHITE,
         );
 
+        if self.region_editor_active {
+            let pointer_to_image = |position: egui::Pos2| {
+                egui::pos2(
+                    ((position.x - image_rect.left()) / image_rect.width() * size[0] as f32)
+                        .clamp(0.0, size[0] as f32),
+                    ((position.y - image_rect.top()) / image_rect.height() * size[1] as f32)
+                        .clamp(0.0, size[1] as f32),
+                )
+            };
+            let region_to_screen = |region: (u32, u32, u32, u32)| {
+                let left =
+                    image_rect.left() + region.0 as f32 / size[0] as f32 * image_rect.width();
+                let top = image_rect.top() + region.1 as f32 / size[1] as f32 * image_rect.height();
+                let right = image_rect.left()
+                    + (region.0 + region.2) as f32 / size[0] as f32 * image_rect.width();
+                let bottom = image_rect.top()
+                    + (region.1 + region.3) as f32 / size[1] as f32 * image_rect.height();
+                egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
+            };
+            let draw_region = |region, color: egui::Color32, label: &str| {
+                let screen_rect = region_to_screen(region);
+                painter.rect_stroke(screen_rect, 0.0, egui::Stroke::new(2.0, color));
+                painter.text(
+                    screen_rect.left_top() + egui::vec2(3.0, 3.0),
+                    egui::Align2::LEFT_TOP,
+                    label,
+                    egui::FontId::proportional(11.0),
+                    color,
+                );
+            };
+
+            if self.enable_crop {
+                draw_region(
+                    (self.crop_x, self.crop_y, self.crop_w, self.crop_h),
+                    egui::Color32::from_rgb(255, 90, 90),
+                    "Skärmklipp",
+                );
+            }
+            for (index, region) in self.ocr_regions.iter().copied().enumerate() {
+                draw_region(
+                    region,
+                    egui::Color32::from_rgb(90, 170, 255),
+                    &format!("OCR {}", index + 1),
+                );
+            }
+            for (index, region) in self.measurement_regions.iter().copied().enumerate() {
+                draw_region(
+                    region,
+                    egui::Color32::from_rgb(255, 210, 70),
+                    &format!("Mät {}", index + 1),
+                );
+            }
+
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(position) = response.interact_pointer_pos() {
+                    if image_rect.contains(position) {
+                        self.region_drag_start = Some(pointer_to_image(position));
+                    }
+                }
+            }
+            if let (Some(start), Some(position)) =
+                (self.region_drag_start, response.interact_pointer_pos())
+            {
+                let current = pointer_to_image(position);
+                let preview_region = egui::Rect::from_two_pos(start, current);
+                let color = match self.region_editor_kind.as_str() {
+                    "screenshot" => egui::Color32::from_rgb(255, 90, 90),
+                    "ocr" => egui::Color32::from_rgb(90, 170, 255),
+                    _ => egui::Color32::from_rgb(255, 210, 70),
+                };
+                painter.rect_stroke(
+                    region_to_screen((
+                        preview_region.min.x.floor() as u32,
+                        preview_region.min.y.floor() as u32,
+                        preview_region.width().ceil() as u32,
+                        preview_region.height().ceil() as u32,
+                    )),
+                    0.0,
+                    egui::Stroke::new(2.0, color),
+                );
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if let (Some(start), Some(position)) = (
+                    self.region_drag_start.take(),
+                    response.interact_pointer_pos(),
+                ) {
+                    let selection = egui::Rect::from_two_pos(start, pointer_to_image(position));
+                    let region = (
+                        selection.min.x.floor().max(0.0) as u32,
+                        selection.min.y.floor().max(0.0) as u32,
+                        selection.width().ceil() as u32,
+                        selection.height().ceil() as u32,
+                    );
+                    if region.2 > 0 && region.3 > 0 {
+                        match self.region_editor_kind.as_str() {
+                            "screenshot" => {
+                                self.enable_crop = true;
+                                self.crop_x = region.0;
+                                self.crop_y = region.1;
+                                self.crop_w = region.2;
+                                self.crop_h = region.3;
+                            }
+                            "ocr" => {
+                                self.enable_ocr = true;
+                                self.ocr_regions.push(region);
+                            }
+                            _ => {
+                                self.measurement_regions.push(region);
+                                if self.measurement_regions.len() == 1 {
+                                    self.indicator_x = region.0;
+                                    self.indicator_y = region.1;
+                                    self.indicator_w = region.2;
+                                    self.indicator_h = region.3;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if response.hovered() {
-            ui.ctx().set_cursor_icon(if response.dragged() {
+            ui.ctx().set_cursor_icon(if self.region_editor_active {
+                egui::CursorIcon::Crosshair
+            } else if response.dragged() {
                 egui::CursorIcon::Grabbing
             } else {
                 egui::CursorIcon::Grab
@@ -1080,10 +1633,12 @@ impl eframe::App for AscApp {
                         description,
                         moves,
                         clicks,
+                        typed_words,
                     } => {
                         self.mouse_last_activity = description;
                         self.mouse_moves = moves;
                         self.mouse_clicks = clicks;
+                        self.mouse_typed_words = typed_words;
                         self.mouse_status = "Musautomatisering körs.".to_string();
                     }
                     mouse_sim::Event::Status(status) => self.mouse_status = status,
@@ -1132,6 +1687,10 @@ impl eframe::App for AscApp {
                     }
                     WorkerMessage::Error(err) => {
                         self.status_text = format!("Fel: {}", err);
+                    }
+                    WorkerMessage::KeywordColor(result) => {
+                        self.keyword_results.push(result);
+                        analysis_changed = true;
                     }
                     WorkerMessage::OfflineDone(msg) => {
                         self.status_text = msg;
@@ -1204,12 +1763,18 @@ impl eframe::App for AscApp {
                 });
                 ui.separator();
 
-                ui.add_enabled_ui(!self.is_running, |ui| {
+                ui.add_enabled_ui(!self.is_running || self.mode == "live", |ui| {
                     // Lägeval
                     ui.label("Läge:");
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut self.mode, "live".to_string(), "Live-övervakning");
-                        ui.radio_value(&mut self.mode, "offline".to_string(), "Efterhandsanalys");
+                    ui.add_enabled_ui(!self.is_running, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut self.mode, "live".to_string(), "Live-övervakning");
+                            ui.radio_value(
+                                &mut self.mode,
+                                "offline".to_string(),
+                                "Efterhandsanalys",
+                            );
+                        });
                     });
                     ui.add_space(5.0);
 
@@ -1334,11 +1899,51 @@ impl eframe::App for AscApp {
 
                     ui.horizontal(|ui| {
                         ui.label("Jämförelse-tröskel:");
-                        ui.add(egui::Slider::new(&mut self.threshold_pct, 0.1..=10.0).text("%"));
+                        ui.add(
+                            egui::Slider::new(&mut self.threshold_pct, 0.0001..=10.0)
+                                .logarithmic(true)
+                                .custom_formatter(|value, _| format!("{value:.5} %")),
+                        );
                     });
+                    ui.checkbox(
+                        &mut self.detect_small_changes,
+                        "Upptäck små lokala färgförändringar",
+                    );
+                    if self.detect_small_changes {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Minst");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.small_change_min_pixels)
+                                        .range(1..=100_000)
+                                        .suffix(" ändrade pixlar"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Minsta färgskillnad per pixel:");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.small_change_color_delta)
+                                        .range(1..=255),
+                                );
+                            });
+                            ui.small(
+                                "För en cirka 5 px bred färgindikator: prova 5 pixlar och färgskillnad 24.",
+                            );
+                        });
+                    }
                     ui.add_space(8.0);
 
                     // Beskärning
+                    if ui.button("Välj områden visuellt...").clicked() {
+                        self.start_region_editor(ctx);
+                    }
+                    if !self.ocr_regions.is_empty() || !self.measurement_regions.is_empty() {
+                        ui.small(format!(
+                            "Visuellt valda områden: {} OCR, {} pixel/färg",
+                            self.ocr_regions.len(),
+                            self.measurement_regions.len()
+                        ));
+                    }
                     ui.checkbox(&mut self.enable_crop, "Beskär skärmklipp");
                     if self.enable_crop {
                         ui.group(|ui| {
@@ -1366,6 +1971,12 @@ impl eframe::App for AscApp {
                     if self.enable_ocr {
                         ui.group(|ui| {
                             ui.checkbox(&mut self.enable_ocr_crop, "Beskär OCR-område");
+                            if !self.ocr_regions.is_empty() {
+                                ui.label(format!(
+                                    "{} visuellt valda OCR-områden används.",
+                                    self.ocr_regions.len()
+                                ));
+                            }
                             if self.enable_ocr_crop {
                                 ui.horizontal(|ui| {
                                     ui.label("X:");
@@ -1381,6 +1992,57 @@ impl eframe::App for AscApp {
                                 });
                             }
                         });
+
+                        ui.add_space(5.0);
+                        ui.checkbox(
+                            &mut self.enable_keyword_color,
+                            "Koppla OCR-sökord till grön/röd indikator",
+                        );
+                        if self.enable_keyword_color {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Sökord:");
+                                    ui.text_edit_singleline(&mut self.keyword);
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Läs färgen efter:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.keyword_delay_frames)
+                                            .range(0..=1_000)
+                                            .suffix(" skärmklipp"),
+                                    );
+                                });
+                                ui.checkbox(
+                                    &mut self.keyword_rising_edge_only,
+                                    "Räkna bara när ordet nyss dyker upp",
+                                );
+                                ui.label("Indikatorområde (eller första gula mätområdet):");
+                                ui.horizontal(|ui| {
+                                    ui.label("X:");
+                                    ui.add(egui::DragValue::new(&mut self.indicator_x));
+                                    ui.label("Y:");
+                                    ui.add(egui::DragValue::new(&mut self.indicator_y));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Bredd:");
+                                    ui.add(egui::DragValue::new(&mut self.indicator_w));
+                                    ui.label("Höjd:");
+                                    ui.add(egui::DragValue::new(&mut self.indicator_h));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Färgdominans:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.indicator_color_delta)
+                                            .range(1..=255),
+                                    );
+                                    ui.label("Min pixlar:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.indicator_min_pixels)
+                                            .range(1..=100_000),
+                                    );
+                                });
+                            });
+                        }
                     }
                 });
 
@@ -1424,6 +2086,17 @@ impl eframe::App for AscApp {
                     {
                         self.stop_monitoring();
                     }
+                    if self.mode == "live"
+                        && ui
+                            .add_sized(
+                                [ui.available_width(), 34.0],
+                                egui::Button::new("Tillämpa ändringar under körning")
+                                    .fill(egui::Color32::from_rgb(70, 110, 180)),
+                            )
+                            .clicked()
+                    {
+                        self.apply_live_settings(ctx.clone());
+                    }
                 }
 
                 // Visa status
@@ -1463,10 +2136,32 @@ impl eframe::App for AscApp {
                                 / self.diffs_history.len() as f64)
                                 * 100.0
                         };
-                        ui.heading(format!("{:.2}%", avg));
+                        ui.heading(format!("{:.5}%", avg));
                     });
                 });
             });
+            if self.enable_keyword_color || !self.keyword_results.is_empty() {
+                let green = self
+                    .keyword_results
+                    .iter()
+                    .filter(|result| result.color == analysis::IndicatorColor::Green)
+                    .count();
+                let red = self
+                    .keyword_results
+                    .iter()
+                    .filter(|result| result.color == analysis::IndicatorColor::Red)
+                    .count();
+                let gray = self.keyword_results.len().saturating_sub(green + red);
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format!("OCR-ord ‘{}’:", self.keyword));
+                    ui.colored_label(egui::Color32::GREEN, format!("Grön {green}"));
+                    ui.colored_label(egui::Color32::RED, format!("Röd {red}"));
+                    ui.label(format!("Grå/okänd {gray}"));
+                    if let Some(latest) = self.keyword_results.last() {
+                        ui.label(format!("Senast: {}", latest.color.label()));
+                    }
+                });
+            }
             ui.separator();
 
             // Skillnadsgraf (Egengjord linjegraf ritad via Painter)
@@ -1570,7 +2265,11 @@ fn csv_field(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn write_analysis(directory: &Path, logs: &[LogItem]) -> Result<(), String> {
+fn write_analysis(
+    directory: &Path,
+    logs: &[LogItem],
+    keyword_results: &[KeywordColorResult],
+) -> Result<(), String> {
     if !directory.is_dir() {
         return Err("analysmappen finns inte".to_string());
     }
@@ -1580,20 +2279,42 @@ fn write_analysis(directory: &Path, logs: &[LogItem]) -> Result<(), String> {
     fs::write(directory.join("asc-analysis.json"), json)
         .map_err(|error| format!("kunde inte skriva asc-analysis.json: {error}"))?;
 
-    let mut csv = String::from("timestamp,file_name,pixel_diff_percent,ocr_text,is_changed\n");
+    let mut csv =
+        String::from("timestamp,file_name,pixel_diff_percent,changed_pixels,ocr_text,is_changed\n");
     for item in logs {
         let _ = writeln!(
             csv,
-            "{},{},{:.6},{},{}",
+            "{},{},{:.6},{},{},{}",
             csv_field(&item.timestamp),
             csv_field(&item.file_name),
             item.pixel_diff * 100.0,
+            item.changed_pixels,
             csv_field(&item.ocr_text),
             item.is_changed
         );
     }
     fs::write(directory.join("asc-analysis.csv"), csv)
         .map_err(|error| format!("kunde inte skriva asc-analysis.csv: {error}"))?;
+
+    let keyword_json = serde_json::to_vec_pretty(keyword_results)
+        .map_err(|error| format!("kunde inte skapa ord-/färg-JSON: {error}"))?;
+    fs::write(directory.join("asc-keyword-colors.json"), keyword_json)
+        .map_err(|error| format!("kunde inte skriva asc-keyword-colors.json: {error}"))?;
+
+    let mut keyword_csv = String::from("timestamp,file_name,keyword,color,ocr_text\n");
+    for result in keyword_results {
+        let _ = writeln!(
+            keyword_csv,
+            "{},{},{},{},{}",
+            csv_field(&result.timestamp),
+            csv_field(&result.file_name),
+            csv_field(&result.keyword),
+            result.color.label(),
+            csv_field(&result.ocr_text),
+        );
+    }
+    fs::write(directory.join("asc-keyword-colors.csv"), keyword_csv)
+        .map_err(|error| format!("kunde inte skriva asc-keyword-colors.csv: {error}"))?;
 
     Ok(())
 }
@@ -1615,7 +2336,7 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod export_tests {
-    use super::{csv_field, write_analysis, LogItem};
+    use super::{csv_field, write_analysis, KeywordColorResult, LogItem};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1636,20 +2357,33 @@ mod export_tests {
         let logs = vec![LogItem {
             timestamp: "12:34:56".to_string(),
             pixel_diff: 0.0125,
+            changed_pixels: 42,
             ocr_text: "Rad 1, \"test\"".to_string(),
             is_changed: true,
             file_name: "capture.png".to_string(),
         }];
 
-        write_analysis(&directory, &logs).expect("analysen ska kunna exporteras");
+        let keyword_results = vec![KeywordColorResult {
+            timestamp: "12:34:57".to_string(),
+            file_name: "capture.png".to_string(),
+            keyword: "öppet".to_string(),
+            color: crate::analysis::IndicatorColor::Green,
+            ocr_text: "Status öppet".to_string(),
+        }];
+
+        write_analysis(&directory, &logs, &keyword_results).expect("analysen ska kunna exporteras");
 
         let csv =
             fs::read_to_string(directory.join("asc-analysis.csv")).expect("CSV-filen ska finnas");
         let json =
             fs::read_to_string(directory.join("asc-analysis.json")).expect("JSON-filen ska finnas");
         assert!(csv.contains("1.250000"));
+        assert!(csv.contains(",42,"));
         assert!(csv.contains("\"Rad 1, \"\"test\"\"\""));
         assert!(json.contains("\"is_changed\": true"));
+        let keyword_csv = fs::read_to_string(directory.join("asc-keyword-colors.csv"))
+            .expect("ord-/färg-CSV ska finnas");
+        assert!(keyword_csv.contains("\"öppet\",grön"));
 
         fs::remove_dir_all(directory).expect("testmappen ska kunna tas bort");
     }

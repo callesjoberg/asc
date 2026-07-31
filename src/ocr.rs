@@ -63,8 +63,10 @@ pub fn run_ocr(image_path: &str) -> Result<String, String> {
         })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(format!("OCR-processen returnerade ett fel: {}", stderr));
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if stderr.is_empty() { stdout } else { stderr };
+        return Err(format!("OCR-processen returnerade ett fel: {details}"));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

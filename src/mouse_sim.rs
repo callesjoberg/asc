@@ -1,4 +1,4 @@
-use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
+use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 use rand::Rng;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -14,6 +14,11 @@ pub struct Config {
     pub click_enabled: bool,
     pub click_every: u32,
     pub window_ids: Vec<u32>,
+    pub typing_enabled: bool,
+    pub typing_chance: f64,
+    pub typing_words: Vec<String>,
+    pub typing_min_words: u32,
+    pub typing_max_words: u32,
     pub stop_after: Option<Duration>,
 }
 
@@ -23,6 +28,7 @@ pub enum Event {
         description: String,
         moves: u64,
         clicks: u64,
+        typed_words: u64,
     },
     Status(String),
     Stopped(String),
@@ -47,6 +53,7 @@ pub fn run(config: Config, control: Receiver<()>, events: Sender<Event>) {
     let mut rng = rand::rng();
     let mut moves = 0_u64;
     let mut clicks = 0_u64;
+    let mut typed_words = 0_u64;
     let mut previous_window = None;
 
     loop {
@@ -65,9 +72,13 @@ pub fn run(config: Config, control: Receiver<()>, events: Sender<Event>) {
         let should_click = config.click_enabled
             && !config.window_ids.is_empty()
             && next_move.is_multiple_of(config.click_every.max(1) as u64);
+        let should_type = should_click
+            && config.typing_enabled
+            && !config.typing_words.is_empty()
+            && rng.random_bool(config.typing_chance.clamp(0.0, 1.0));
 
         let window_target = if should_click {
-            find_window_target(&config.window_ids, previous_window, &mut rng)
+            find_window_target(&config.window_ids, previous_window, should_type, &mut rng)
         } else {
             None
         };
@@ -95,7 +106,39 @@ pub fn run(config: Config, control: Receiver<()>, events: Sender<Event>) {
             }
             clicks += 1;
             previous_window = Some(window_id);
-            format!("Flyttade och klickade på titelraden: {title}")
+            if should_type {
+                if let Some(reason) = interrupted(
+                    &control,
+                    &enigo,
+                    Duration::from_millis(rng.random_range(250..=700)),
+                ) {
+                    let _ = events.send(Event::Stopped(reason));
+                    return;
+                }
+                let word_count = rng.random_range(
+                    config.typing_min_words.min(config.typing_max_words).max(1)
+                        ..=config.typing_min_words.max(config.typing_max_words).max(1),
+                );
+                let mut text = String::new();
+                for index in 0..word_count {
+                    if index > 0 {
+                        text.push(' ');
+                    }
+                    let word_index = rng.random_range(0..config.typing_words.len());
+                    text.push_str(&config.typing_words[word_index]);
+                }
+                text.push(' ');
+                if let Err(error) = enigo.text(&text) {
+                    let _ = events.send(Event::Stopped(format!(
+                        "Textinmatning misslyckades: {error}"
+                    )));
+                    return;
+                }
+                typed_words += u64::from(word_count);
+                format!("Klickade i och skrev {word_count} ord i: {title}")
+            } else {
+                format!("Flyttade och klickade på titelraden: {title}")
+            }
         } else if should_click {
             "Flyttade pekaren; inget valt fönster var tillgängligt för klick.".to_string()
         } else {
@@ -105,6 +148,7 @@ pub fn run(config: Config, control: Receiver<()>, events: Sender<Event>) {
             description,
             moves,
             clicks,
+            typed_words,
         });
 
         if rng.random_bool(config.pause_chance.clamp(0.0, 1.0)) {
@@ -147,6 +191,7 @@ fn random_display_point(enigo: &Enigo, rng: &mut impl Rng) -> Result<(i32, i32),
 fn find_window_target(
     selected_ids: &[u32],
     previous_window: Option<u32>,
+    inside_content: bool,
     rng: &mut impl Rng,
 ) -> Option<(u32, String, i32, i32)> {
     let windows = Window::all().ok()?;
@@ -170,7 +215,11 @@ fn find_window_target(
                 .filter(|title| !title.trim().is_empty())
                 .unwrap_or_else(|| window.app_name().unwrap_or_else(|_| "Fönster".to_string()));
             let target_x = x.saturating_add((width / 2) as i32);
-            let target_y = y.saturating_add(12_i32.min((height / 2) as i32));
+            let target_y = if inside_content {
+                y.saturating_add(((height as f64 * 0.6) as i32).clamp(30, height as i32 - 10))
+            } else {
+                y.saturating_add(12_i32.min((height / 2) as i32))
+            };
             Some((id, title, target_x, target_y))
         })
         .collect::<Vec<_>>();

@@ -16,7 +16,7 @@ jobs:
           - platform: 'macos-latest'
             build-cmd: 'mkdir -p resources && clang -O3 -framework Foundation -framework AppKit -framework Vision src-ocr/macos/ocr-helper.m -o resources/ocr-helper-macos'
           - platform: 'windows-latest'
-            build-cmd: 'mkdir -p resources && dotnet build -c Release src-ocr/windows/OcrHelper.csproj -o resources/ && cp resources/OcrHelper.exe resources/ocr-helper-win.exe'
+            build-cmd: 'mkdir -p resources/ocr-win-publish && dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true src-ocr/windows/OcrHelper.csproj -o resources/ocr-win-publish && cp resources/ocr-win-publish/OcrHelper.exe resources/ocr-helper-win.exe'
     
     runs-on: ${{ matrix.platform }}
     steps:

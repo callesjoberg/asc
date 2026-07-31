@@ -13,14 +13,14 @@ namespace OcrHelper
         {
             if (args.Length < 1)
             {
-                Console.WriteLine("Error: Missing image path argument.");
+                Console.Error.WriteLine("Error: Missing image path argument.");
                 return 1;
             }
 
             string imagePath = Path.GetFullPath(args[0]);
             if (!File.Exists(imagePath))
             {
-                Console.WriteLine($"Error: Image file does not exist at: {imagePath}");
+                Console.Error.WriteLine($"Error: Image file does not exist at: {imagePath}");
                 return 1;
             }
 
@@ -35,7 +35,7 @@ namespace OcrHelper
                         OcrEngine ocrEngine = OcrEngine.TryCreateFromUserProfileLanguages();
                         if (ocrEngine == null)
                         {
-                            Console.WriteLine("Error: Could not create OcrEngine (no languages installed?).");
+                            Console.Error.WriteLine("Error: Could not create OcrEngine (no languages installed?).");
                             return 1;
                         }
 
@@ -46,7 +46,7 @@ namespace OcrHelper
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error performing OCR: {ex.Message}");
+                Console.Error.WriteLine($"Error performing OCR: {ex.Message}");
                 return 1;
             }
 

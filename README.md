@@ -5,10 +5,12 @@ ASC är en plattformsoberoende skrivbordsapp för att övervaka skärmar eller f
 ## Funktioner
 
 - Liveövervakning av skärm eller enskilt fönster
-- Valfri beskärning av skärmklipp och OCR-område
+- Visuell områdesväljare för skärmklipp, flera OCR-områden och flera pixel-/färgområden
 - Förhandsgranskning av beskärningsområdet före analysstart
 - Förändringsanalys med justerbar pixeltröskel
+- Känsligt lokalt läge som kan upptäcka färgväxlingar i indikatorer på bara några pixlar
 - Inbyggd OCR på macOS och Windows
+- Koppling mellan ett OCR-sökord och en grön/röd indikator, med valfri fördröjning och separat statistik/export
 - Efterhandsanalys av PNG- och JPEG-bilder i en mapp
 - Justerbara paneler för inställningar, händelselogg och förhandsgranskning
 - Skärmklippsvisning som passar hela bilden, med zoom och panorering
@@ -17,8 +19,11 @@ ASC är en plattformsoberoende skrivbordsapp för att övervaka skärmar eller f
 - Icke-blockerande mappväljare som låter appen fortsätta svara
 - Separat flik för mjuka, slumpmässiga musrörelser med intervall och pauser
 - Valfria titelradsklick som begränsas till särskilt markerade fönster
+- Valfri textinmatning från en egen ordlista i särskilt markerade fönster
 - Oberoende start/stopp så analys och musautomatisering kan köras samtidigt
+- Analysområden, OCR och trösklar kan ändras och tillämpas under en pågående liveövervakning
 - Automatisk export till `asc-analysis.csv` och `asc-analysis.json`
+- Automatisk export av ord-/färgmätning till `asc-keyword-colors.csv` och `asc-keyword-colors.json`
 
 ## Utveckling
 
@@ -37,11 +42,11 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-På macOS måste appen få behörighet för skärminspelning i Systeminställningar. OCR-hjälpprogrammet i `resources/` bäddas in i appbinären. Windows-hjälpprogrammet byggs automatiskt i GitHub Actions före Rust-bygget.
+På macOS måste appen få behörighet för skärminspelning i Systeminställningar. OCR-hjälpprogrammet i `resources/` bäddas in i appbinären. Windows-hjälpprogrammet publiceras som en självförsörjande enkelfils-EXE i GitHub Actions före Rust-bygget, så någon separat `OcrHelper.dll` eller .NET-installation ska inte behövas.
 
 Den första bilden används som referens. Från och med bild två markeras en förändring när RGB-skillnaden når pixeltröskeln eller när OCR-texten ändras. Analysfilerna uppdateras automatiskt i den valda mappen.
 
-Musautomatiseringen har ett separat start/stopp och kan därför köras samtidigt med analysen. Fönsterklick är avstängt som standard och begränsas till de fönster som användaren uttryckligen markerar. Flytta pekaren till huvudskärmens övre vänstra hörn för nödstopp. På macOS behöver ASC även behörighet under Integritet och säkerhet > Hjälpmedel för att styra muspekaren.
+Musautomatiseringen har ett separat start/stopp och kan därför köras samtidigt med analysen. Fönsterklick och textinmatning är avstängda som standard och begränsas till de fönster som användaren uttryckligen markerar. Textinmatning ändrar innehållet i målprogrammet och ska därför bara aktiveras med en kontrollerad ordlista. Flytta pekaren till huvudskärmens övre vänstra hörn för nödstopp. På macOS behöver ASC även behörighet under Integritet och säkerhet > Hjälpmedel för att styra muspekaren.
 
 ## Release
 
