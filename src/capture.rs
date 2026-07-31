@@ -14,6 +14,88 @@ pub struct MonitorInfo {
     pub name: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct WindowGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn window_geometry(window_id: u32) -> Result<WindowGeometry, String> {
+    let windows = Window::all().map_err(|e| format!("Fönstersökning misslyckades: {e}"))?;
+    let window = windows
+        .into_iter()
+        .find(|window| window.id().unwrap_or(0) == window_id)
+        .ok_or_else(|| format!("Hittade inte fönster med ID {window_id}"))?;
+    if window.is_minimized().unwrap_or(false) {
+        return Err("Det valda fönstret är minimerat.".to_string());
+    }
+    Ok(WindowGeometry {
+        x: window
+            .x()
+            .map_err(|e| format!("Kunde inte läsa fönstrets X-position: {e}"))?,
+        y: window
+            .y()
+            .map_err(|e| format!("Kunde inte läsa fönstrets Y-position: {e}"))?,
+        width: window
+            .width()
+            .map_err(|e| format!("Kunde inte läsa fönstrets bredd: {e}"))?,
+        height: window
+            .height()
+            .map_err(|e| format!("Kunde inte läsa fönstrets höjd: {e}"))?,
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub fn focus_window(window_id: u32) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsWindow, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    let hwnd = HWND(window_id as usize as *mut std::ffi::c_void);
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Err("Det valda fönstret finns inte längre.".to_string());
+        }
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        if !SetForegroundWindow(hwnd).as_bool() {
+            return Err("Windows tillät inte att målfönstret flyttades längst fram.".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn focus_window(window_id: u32) -> Result<(), String> {
+    let window = Window::all()
+        .map_err(|error| format!("Fönstersökning misslyckades: {error}"))?
+        .into_iter()
+        .find(|window| window.id().unwrap_or(0) == window_id)
+        .ok_or_else(|| "Det valda fönstret finns inte längre.".to_string())?;
+    let pid = window
+        .pid()
+        .map_err(|error| format!("Kunde inte läsa målfönstrets process: {error}"))?;
+    let script = format!(
+        "tell application \"System Events\" to set frontmost of first process whose unix id is {pid} to true"
+    );
+    let status = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .status()
+        .map_err(|error| format!("Kunde inte aktivera målfönstret: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("macOS tillät inte att målfönstret flyttades längst fram.".to_string())
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn focus_window(_window_id: u32) -> Result<(), String> {
+    Err("Fönsteraktivering stöds ännu inte på det här operativsystemet.".to_string())
+}
+
 pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
     let windows = Window::all().map_err(|e| format!("Kunde inte hämta fönster: {}", e))?;
     let mut list = Vec::new();

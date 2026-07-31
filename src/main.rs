@@ -45,6 +45,34 @@ enum WorkerMessage {
     OfflineDone(String),
 }
 
+#[derive(Clone)]
+struct AutomationStepEditor {
+    kind: String,
+    value: String,
+    seconds: u64,
+    confidence: f64,
+}
+
+impl AutomationStepEditor {
+    fn click_word() -> Self {
+        Self {
+            kind: "click_word".to_string(),
+            value: String::new(),
+            seconds: 30,
+            confidence: 90.0,
+        }
+    }
+
+    fn wait() -> Self {
+        Self {
+            kind: "wait".to_string(),
+            value: String::new(),
+            seconds: 3,
+            confidence: 90.0,
+        }
+    }
+}
+
 struct AscApp {
     active_tab: String,
 
@@ -84,6 +112,9 @@ struct AscApp {
     region_editor_active: bool,
     region_editor_kind: String,
     region_drag_start: Option<egui::Pos2>,
+    region_source_type: String,
+    region_source_id: Option<u32>,
+    region_source_size: Option<[usize; 2]>,
 
     // Status och historik
     is_running: bool,
@@ -134,11 +165,23 @@ struct AscApp {
     mouse_typing_words: String,
     mouse_typing_min_words: u32,
     mouse_typing_max_words: u32,
+    mouse_typing_window_id: u32,
     mouse_selected_windows: HashSet<u32>,
     mouse_stop_after_enabled: bool,
     mouse_stop_after_minutes: u64,
     mouse_receiver: Option<Receiver<mouse_sim::Event>>,
     mouse_control_sender: Option<Sender<()>>,
+
+    // OCR-styrd RPA-sekvens
+    automation_running: bool,
+    automation_status: String,
+    automation_last_activity: String,
+    automation_window_id: u32,
+    automation_steps: Vec<AutomationStepEditor>,
+    automation_repeat: bool,
+    automation_receiver: Option<Receiver<mouse_sim::Event>>,
+    automation_control_sender: Option<Sender<()>>,
+    automation_image_picker_receiver: Option<Receiver<Option<(usize, String)>>>,
 }
 
 impl Default for AscApp {
@@ -180,6 +223,9 @@ impl Default for AscApp {
             region_editor_active: false,
             region_editor_kind: "screenshot".to_string(),
             region_drag_start: None,
+            region_source_type: String::new(),
+            region_source_id: None,
+            region_source_size: None,
             is_running: false,
             status_text: "Klar att starta".to_string(),
             logs: Vec::new(),
@@ -220,13 +266,28 @@ impl Default for AscApp {
             mouse_typing_words: "hej,anteckning,test,grön,röd,grå".to_string(),
             mouse_typing_min_words: 1,
             mouse_typing_max_words: 3,
+            mouse_typing_window_id: 0,
             mouse_selected_windows: HashSet::new(),
             mouse_stop_after_enabled: true,
             mouse_stop_after_minutes: 60,
             mouse_receiver: None,
             mouse_control_sender: None,
+            automation_running: false,
+            automation_status: "Klar att starta".to_string(),
+            automation_last_activity: "Ingen aktivitet ännu.".to_string(),
+            automation_window_id: 0,
+            automation_steps: vec![
+                AutomationStepEditor::click_word(),
+                AutomationStepEditor::wait(),
+            ],
+            automation_repeat: false,
+            automation_receiver: None,
+            automation_control_sender: None,
+            automation_image_picker_receiver: None,
         };
         app.refresh_sources();
+        app.automation_window_id = app.windows.first().map(|window| window.id).unwrap_or(0);
+        app.mouse_typing_window_id = app.windows.first().map(|window| window.id).unwrap_or(0);
         app
     }
 }
@@ -262,6 +323,21 @@ impl AscApp {
                 self.selected_source_id = self.monitors.first().map(|m| m.id).unwrap_or(0);
             }
         }
+    }
+
+    fn clear_visual_regions(&mut self) {
+        self.enable_crop = false;
+        self.ocr_regions.clear();
+        self.measurement_regions.clear();
+        self.region_editor_active = false;
+        self.region_drag_start = None;
+        self.region_source_type.clear();
+        self.region_source_id = None;
+        self.region_source_size = None;
+    }
+
+    fn has_visual_regions(&self) -> bool {
+        self.enable_crop || !self.ocr_regions.is_empty() || !self.measurement_regions.is_empty()
     }
 
     fn start_monitoring(&mut self, ctx: egui::Context) {
@@ -814,9 +890,19 @@ impl AscApp {
             .collect::<HashSet<_>>();
         self.mouse_selected_windows
             .retain(|window_id| available.contains(window_id));
+        if !available.contains(&self.automation_window_id) {
+            self.automation_window_id = self.windows.first().map(|window| window.id).unwrap_or(0);
+        }
+        if !available.contains(&self.mouse_typing_window_id) {
+            self.mouse_typing_window_id = self.windows.first().map(|window| window.id).unwrap_or(0);
+        }
     }
 
     fn start_mouse_simulation(&mut self, ctx: &egui::Context) {
+        if self.automation_running {
+            self.mouse_status = "Stoppa OCR-klicksekvensen först.".to_string();
+            return;
+        }
         if self.mouse_typing_enabled && !self.mouse_click_enabled {
             self.mouse_status = "Aktivera fönsterklick för att kunna skriva ord.".to_string();
             return;
@@ -836,6 +922,15 @@ impl AscApp {
             self.mouse_status = "Ange minst ett ord för slumpmässig textinmatning.".to_string();
             return;
         }
+        if self.mouse_typing_enabled
+            && !self
+                .windows
+                .iter()
+                .any(|window| window.id == self.mouse_typing_window_id)
+        {
+            self.mouse_status = "Välj ett tillgängligt skrivfönster.".to_string();
+            return;
+        }
 
         let config = mouse_sim::Config {
             interval_min: Duration::from_secs(self.mouse_interval_min.min(self.mouse_interval_max)),
@@ -851,6 +946,9 @@ impl AscApp {
             typing_words,
             typing_min_words: self.mouse_typing_min_words,
             typing_max_words: self.mouse_typing_max_words,
+            typing_window_id: self
+                .mouse_typing_enabled
+                .then_some(self.mouse_typing_window_id),
             stop_after: self
                 .mouse_stop_after_enabled
                 .then(|| Duration::from_secs(self.mouse_stop_after_minutes.max(1) * 60)),
@@ -874,6 +972,86 @@ impl AscApp {
             let _ = sender.send(());
         }
         self.mouse_status = "Stoppar…".to_string();
+    }
+
+    fn start_automation(&mut self, ctx: &egui::Context) {
+        if self.mouse_running {
+            self.automation_status = "Stoppa muspekarsimuleringen först.".to_string();
+            return;
+        }
+        if !self
+            .windows
+            .iter()
+            .any(|window| window.id == self.automation_window_id)
+        {
+            self.automation_status = "Välj ett tillgängligt fönster först.".to_string();
+            return;
+        }
+
+        let mut steps = Vec::new();
+        for (index, step) in self.automation_steps.iter().enumerate() {
+            match step.kind.as_str() {
+                "wait" => steps.push(mouse_sim::AutomationStep::Wait(Duration::from_secs(
+                    step.seconds,
+                ))),
+                "type_text" => {
+                    if step.value.is_empty() {
+                        self.automation_status =
+                            format!("Steg {} saknar text att skriva.", index + 1);
+                        return;
+                    }
+                    steps.push(mouse_sim::AutomationStep::TypeText(step.value.clone()));
+                }
+                "click_image" => {
+                    if !Path::new(&step.value).is_file() {
+                        self.automation_status =
+                            format!("Steg {} saknar en giltig referensbild.", index + 1);
+                        return;
+                    }
+                    steps.push(mouse_sim::AutomationStep::ClickImage {
+                        image_path: step.value.clone(),
+                        timeout: Duration::from_secs(step.seconds.max(1)),
+                        confidence: step.confidence / 100.0,
+                    });
+                }
+                _ => {
+                    if step.value.trim().is_empty() {
+                        self.automation_status = format!("Steg {} saknar OCR-ord.", index + 1);
+                        return;
+                    }
+                    steps.push(mouse_sim::AutomationStep::ClickOcrWord {
+                        word: step.value.trim().to_string(),
+                        timeout: Duration::from_secs(step.seconds.max(1)),
+                    });
+                }
+            }
+        }
+        if steps.is_empty() {
+            self.automation_status = "Lägg till minst ett flödessteg.".to_string();
+            return;
+        }
+
+        let config = mouse_sim::OcrSequenceConfig {
+            window_id: self.automation_window_id,
+            steps,
+            repeat: self.automation_repeat,
+        };
+        let (event_tx, event_rx) = channel();
+        let (control_tx, control_rx) = channel();
+        self.automation_receiver = Some(event_rx);
+        self.automation_control_sender = Some(control_tx);
+        self.automation_running = true;
+        self.automation_status = "OCR-klicksekvensen körs.".to_string();
+        self.automation_last_activity = "Startar första steget…".to_string();
+        std::thread::spawn(move || mouse_sim::run_ocr_sequence(config, control_rx, event_tx));
+        ctx.request_repaint();
+    }
+
+    fn stop_automation(&mut self) {
+        if let Some(sender) = self.automation_control_sender.as_ref() {
+            let _ = sender.send(());
+        }
+        self.automation_status = "Stoppar…".to_string();
     }
 
     fn show_mouse_tab(&mut self, ctx: &egui::Context) {
@@ -1036,8 +1214,36 @@ impl AscApp {
                             });
                             ui.label("Ordlista, separerad med kommatecken:");
                             ui.text_edit_singleline(&mut self.mouse_typing_words);
+                            ui.horizontal(|ui| {
+                                ui.label("Skriv endast i:");
+                                egui::ComboBox::from_id_source("mouse_typing_window")
+                                    .width(380.0)
+                                    .selected_text(
+                                        self.windows
+                                            .iter()
+                                            .find(|window| {
+                                                window.id == self.mouse_typing_window_id
+                                            })
+                                            .map(|window| {
+                                                format!("{} — {}", window.app_name, window.title)
+                                            })
+                                            .unwrap_or_else(|| "Välj fönster…".to_string()),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for window in &self.windows {
+                                            ui.selectable_value(
+                                                &mut self.mouse_typing_window_id,
+                                                window.id,
+                                                format!(
+                                                    "{} — {}",
+                                                    window.app_name, window.title
+                                                ),
+                                            );
+                                        }
+                                    });
+                            });
                             ui.small(
-                                "Vid skrivning klickar ASC i fönstrets innehållsyta i stället för titelraden.",
+                                "Vid skrivning klickar ASC endast i det valda skrivfönstrets innehållsyta.",
                             );
                         }
                     }
@@ -1083,6 +1289,239 @@ impl AscApp {
                     .clicked()
                 {
                     self.start_mouse_simulation(ctx);
+                }
+            });
+        });
+    }
+
+    fn show_automation_tab(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("RPA-klicksekvens");
+            ui.label(
+                "Bygg ett flöde som väntar, hittar text eller bilder, klickar och skriver i ett valt fönster.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Status:");
+                ui.colored_label(
+                    if self.automation_running {
+                        egui::Color32::GREEN
+                    } else {
+                        egui::Color32::LIGHT_GRAY
+                    },
+                    &self.automation_status,
+                );
+            });
+            ui.small(format!("Senast: {}", self.automation_last_activity));
+            ui.separator();
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_enabled_ui(!self.automation_running, |ui| {
+                    ui.heading("Målfönster");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_source("automation_window_combo")
+                            .width(420.0)
+                            .selected_text(
+                                self.windows
+                                    .iter()
+                                    .find(|window| window.id == self.automation_window_id)
+                                    .map(|window| {
+                                        format!("{} — {}", window.app_name, window.title)
+                                    })
+                                    .unwrap_or_else(|| "Välj fönster…".to_string()),
+                            )
+                            .show_ui(ui, |ui| {
+                                for window in &self.windows {
+                                    ui.selectable_value(
+                                        &mut self.automation_window_id,
+                                        window.id,
+                                        format!("{} — {}", window.app_name, window.title),
+                                    );
+                                }
+                            });
+                        if ui.button("Uppdatera fönster").clicked() {
+                            self.refresh_mouse_windows();
+                        }
+                    });
+                    ui.small(
+                        "Alla OCR-klick begränsas till det valda fönstrets aktuella innehåll.",
+                    );
+
+                    ui.add_space(14.0);
+                    ui.heading("Flödessteg");
+                    let mut remove = None;
+                    let mut move_up = None;
+                    let mut move_down = None;
+                    let mut pick_image = None;
+                    let image_picker_running = self.automation_image_picker_receiver.is_some();
+                    let step_count = self.automation_steps.len();
+                    for (index, step) in self.automation_steps.iter_mut().enumerate() {
+                        ui.group(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(format!("{}", index + 1));
+                                egui::ComboBox::from_id_source(("automation_step", index))
+                                    .selected_text(match step.kind.as_str() {
+                                        "wait" => "Vänta",
+                                        "type_text" => "Skriv text",
+                                        "click_image" => "Klicka på bild",
+                                        _ => "Klicka på OCR-ord",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut step.kind,
+                                            "click_word".to_string(),
+                                            "Klicka på OCR-ord",
+                                        );
+                                        ui.selectable_value(
+                                            &mut step.kind,
+                                            "click_image".to_string(),
+                                            "Klicka på bild",
+                                        );
+                                        ui.selectable_value(
+                                            &mut step.kind,
+                                            "wait".to_string(),
+                                            "Vänta",
+                                        );
+                                        ui.selectable_value(
+                                            &mut step.kind,
+                                            "type_text".to_string(),
+                                            "Skriv text",
+                                        );
+                                    });
+                                match step.kind.as_str() {
+                                    "wait" => {
+                                        ui.add(
+                                            egui::DragValue::new(&mut step.seconds)
+                                                .range(0..=3_600)
+                                                .suffix(" sekunder"),
+                                        );
+                                    }
+                                    "type_text" => {
+                                        ui.label("Text:");
+                                        ui.text_edit_singleline(&mut step.value);
+                                    }
+                                    "click_image" => {
+                                        ui.label("Bild:");
+                                        ui.text_edit_singleline(&mut step.value);
+                                        if ui
+                                            .add_enabled(
+                                                !image_picker_running,
+                                                egui::Button::new("Välj…"),
+                                            )
+                                            .clicked()
+                                        {
+                                            pick_image = Some(index);
+                                        }
+                                        ui.label("Likhet:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut step.confidence)
+                                                .range(50.0..=100.0)
+                                                .suffix(" %"),
+                                        );
+                                        ui.label("Timeout:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut step.seconds)
+                                                .range(1..=600)
+                                                .suffix(" sek"),
+                                        );
+                                    }
+                                    _ => {
+                                        ui.label("Ord:");
+                                        ui.text_edit_singleline(&mut step.value);
+                                        ui.label("Timeout:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut step.seconds)
+                                                .range(1..=600)
+                                                .suffix(" sek"),
+                                        );
+                                    }
+                                }
+                                if ui.small_button("↑").clicked() && index > 0 {
+                                    move_up = Some(index);
+                                }
+                                if ui.small_button("↓").clicked() && index + 1 < step_count {
+                                    move_down = Some(index);
+                                }
+                                if ui.small_button("Ta bort").clicked() {
+                                    remove = Some(index);
+                                }
+                            });
+                        });
+                    }
+                    if let Some(index) = move_up {
+                        self.automation_steps.swap(index, index - 1);
+                    } else if let Some(index) = move_down {
+                        self.automation_steps.swap(index, index + 1);
+                    } else if let Some(index) = remove {
+                        self.automation_steps.remove(index);
+                    }
+                    if let Some(index) = pick_image {
+                        let (picker_tx, picker_rx) = channel();
+                        self.automation_image_picker_receiver = Some(picker_rx);
+                        let repaint_ctx = ctx.clone();
+                        std::thread::spawn(move || {
+                            let result = rfd::FileDialog::new()
+                                .set_title("Välj referensbild")
+                                .add_filter("Bild", &["png", "jpg", "jpeg"])
+                                .pick_file()
+                                .map(|path| (index, path.to_string_lossy().to_string()));
+                            let _ = picker_tx.send(result);
+                            repaint_ctx.request_repaint();
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("+ OCR-klick").clicked() {
+                            self.automation_steps.push(AutomationStepEditor::click_word());
+                        }
+                        if ui.button("+ Vänta").clicked() {
+                            self.automation_steps.push(AutomationStepEditor::wait());
+                        }
+                        if ui.button("+ Bildklick").clicked() {
+                            self.automation_steps.push(AutomationStepEditor {
+                                kind: "click_image".to_string(),
+                                value: String::new(),
+                                seconds: 30,
+                                confidence: 90.0,
+                            });
+                        }
+                        if ui.button("+ Skriv text").clicked() {
+                            self.automation_steps.push(AutomationStepEditor {
+                            kind: "type_text".to_string(),
+                            value: String::new(),
+                            seconds: 0,
+                            confidence: 90.0,
+                            });
+                        }
+                    });
+                    ui.small("Referensbilden bör vara ett tätt beskuret PNG-klipp av knappen eller ikonen i samma skala som i målfönstret.");
+                    ui.checkbox(&mut self.automation_repeat, "Upprepa hela flödet");
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Kontrollera flödet utan Upprepa först. Klick och text kan ändra innehåll eller starta nedladdningar.",
+                    );
+                    ui.label("Nödstopp: flytta muspekaren till skärmens övre vänstra hörn.");
+                });
+
+                ui.add_space(16.0);
+                if self.automation_running {
+                    if ui
+                        .add_sized(
+                            [240.0, 42.0],
+                            egui::Button::new("Stoppa klicksekvens")
+                                .fill(egui::Color32::from_rgb(180, 60, 60)),
+                        )
+                        .clicked()
+                    {
+                        self.stop_automation();
+                    }
+                } else if ui
+                    .add_sized(
+                        [240.0, 42.0],
+                        egui::Button::new("Kör klicksekvens")
+                            .fill(egui::Color32::from_rgb(60, 160, 60)),
+                    )
+                    .clicked()
+                {
+                    self.start_automation(ctx);
                 }
             });
         });
@@ -1191,11 +1630,32 @@ impl AscApp {
 
         match result {
             Ok(image) => {
+                let image_size = [image.width() as usize, image.height() as usize];
+                let source_type = if self.mode == "live" {
+                    self.source_type.clone()
+                } else {
+                    format!("offline:{}", self.save_dir)
+                };
+                let source_id = (self.mode == "live").then_some(self.selected_source_id);
+                let cleared_stale_regions = self.has_visual_regions()
+                    && (self.region_source_type != source_type
+                        || self.region_source_id != source_id
+                        || self.region_source_size != Some(image_size));
+                if cleared_stale_regions {
+                    self.clear_visual_regions();
+                }
+                self.region_source_type = source_type;
+                self.region_source_id = source_id;
+                self.region_source_size = Some(image_size);
                 self.display_preview_image(image, "Områdesväljare".to_string(), ctx);
                 self.region_editor_active = true;
                 self.region_drag_start = None;
-                self.status_text =
-                    "Dra områden direkt i förhandsvisningen och tryck sedan Klar.".to_string();
+                self.status_text = if cleared_stale_regions {
+                    "Källan eller storleken ändrades. Gamla områden rensades; markera nya områden."
+                        .to_string()
+                } else {
+                    "Dra områden direkt i förhandsvisningen och tryck sedan Klar.".to_string()
+                };
             }
             Err(error) => self.status_text = format!("Områdesväljarfel: {error}"),
         }
@@ -1625,6 +2085,26 @@ impl eframe::App for AscApp {
             }
         }
 
+        let image_picker_result =
+            self.automation_image_picker_receiver
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                });
+        if let Some(result) = image_picker_result {
+            self.automation_image_picker_receiver = None;
+            if let Some((index, path)) = result {
+                if let Some(step) = self.automation_steps.get_mut(index) {
+                    if step.kind == "click_image" {
+                        step.value = path;
+                        self.automation_status = "Referensbild vald.".to_string();
+                    }
+                }
+            }
+        }
+
         let mut mouse_stopped = None;
         if let Some(receiver) = self.mouse_receiver.as_ref() {
             while let Ok(event) = receiver.try_recv() {
@@ -1652,6 +2132,28 @@ impl eframe::App for AscApp {
             self.mouse_receiver = None;
             self.mouse_control_sender = None;
         } else if self.mouse_running {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        let mut automation_stopped = None;
+        if let Some(receiver) = self.automation_receiver.as_ref() {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    mouse_sim::Event::Activity { description, .. } => {
+                        self.automation_last_activity = description;
+                        self.automation_status = "OCR-klicksekvensen körs.".to_string();
+                    }
+                    mouse_sim::Event::Status(status) => self.automation_status = status,
+                    mouse_sim::Event::Stopped(reason) => automation_stopped = Some(reason),
+                }
+            }
+        }
+        if let Some(reason) = automation_stopped {
+            self.automation_running = false;
+            self.automation_status = reason;
+            self.automation_receiver = None;
+            self.automation_control_sender = None;
+        } else if self.automation_running {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -1740,10 +2242,23 @@ impl eframe::App for AscApp {
                         "Muspekar-simulering"
                     },
                 );
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    "automation".to_string(),
+                    if self.automation_running {
+                        "RPA-sekvens • körs"
+                    } else {
+                        "RPA-sekvens"
+                    },
+                );
             });
         });
         if self.active_tab == "mouse" {
             self.show_mouse_tab(ctx);
+            return;
+        }
+        if self.active_tab == "automation" {
+            self.show_automation_tab(ctx);
             return;
         }
 
@@ -1780,6 +2295,7 @@ impl eframe::App for AscApp {
 
                     // Källa
                     if self.mode == "live" {
+                        let source_before = (self.source_type.clone(), self.selected_source_id);
                         ui.horizontal(|ui| {
                             ui.label("Källtyp:");
                             if ui
@@ -1847,6 +2363,12 @@ impl eframe::App for AscApp {
                                 self.refresh_sources();
                             }
                         });
+                        if source_before != (self.source_type.clone(), self.selected_source_id)
+                            && self.has_visual_regions()
+                        {
+                            self.clear_visual_regions();
+                            self.status_text = "Källan ändrades. Gamla visuella områden rensades så att koordinaterna inte återanvänds på fel fönster.".to_string();
+                        }
                         ui.add_space(5.0);
                     }
 

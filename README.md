@@ -20,6 +20,10 @@ ASC är en plattformsoberoende skrivbordsapp för att övervaka skärmar eller f
 - Separat flik för mjuka, slumpmässiga musrörelser med intervall och pauser
 - Valfria titelradsklick som begränsas till särskilt markerade fönster
 - Valfri textinmatning från en egen ordlista i särskilt markerade fönster
+- Ett separat val anger exakt vilket fönster som får ta emot slumpmässigt inskriven text
+- Egen RPA-flik med ordnade steg för väntan, OCR-klick, bildmatchningsklick och textinmatning
+- OCR-klick kan hitta både enstaka ord och fraser, exempelvis `Ladda ner`
+- Målfönstret flyttas längst fram före automatiserade klick; flödet stoppas om det inte kan aktiveras
 - Oberoende start/stopp så analys och musautomatisering kan köras samtidigt
 - Analysområden, OCR och trösklar kan ändras och tillämpas under en pågående liveövervakning
 - Automatisk export till `asc-analysis.csv` och `asc-analysis.json`
@@ -46,7 +50,11 @@ På macOS måste appen få behörighet för skärminspelning i Systeminställnin
 
 Den första bilden används som referens. Från och med bild två markeras en förändring när RGB-skillnaden når pixeltröskeln eller när OCR-texten ändras. Analysfilerna uppdateras automatiskt i den valda mappen.
 
-Musautomatiseringen har ett separat start/stopp och kan därför köras samtidigt med analysen. Fönsterklick och textinmatning är avstängda som standard och begränsas till de fönster som användaren uttryckligen markerar. Textinmatning ändrar innehållet i målprogrammet och ska därför bara aktiveras med en kontrollerad ordlista. Flytta pekaren till huvudskärmens övre vänstra hörn för nödstopp. På macOS behöver ASC även behörighet under Integritet och säkerhet > Hjälpmedel för att styra muspekaren.
+Musautomatiseringen har ett separat start/stopp och kan därför köras samtidigt med analysen. Fönsterklick och textinmatning är avstängda som standard och begränsas till de fönster som användaren uttryckligen markerar. Textinmatning ändrar innehållet i målprogrammet och ska därför bara aktiveras med en kontrollerad ordlista.
+
+RPA-flödet arbetar mot ett enda valt fönster. Ett OCR-steg söker efter ordets eller frasens aktuella bildposition. Ett bildsteg söker efter en tätt beskuren PNG- eller JPEG-referens i samma skala. Använd explicita väntesteg efter klick som laddar en ny sida eller startar en nedladdning. Windows OCR-hjälpare körs dolt utan blinkande konsolfönster.
+
+Flytta pekaren till huvudskärmens övre vänstra hörn för nödstopp. På macOS behöver ASC även behörighet under Integritet och säkerhet > Hjälpmedel för att styra muspekaren.
 
 ## Release
 

@@ -33,11 +33,39 @@ int main(int argc, const char * argv[]) {
             }
             
             NSArray *results = request.results;
+            BOOL wordsJSON = argc > 2 && strcmp(argv[2], "--words-json") == 0;
+            NSMutableArray *words = [NSMutableArray array];
             for (VNRecognizedTextObservation *observation in results) {
                 NSArray<VNRecognizedText *> *topCandidates = [observation topCandidates:1];
                 if (topCandidates.count > 0) {
-                    printf("%s\n", [[topCandidates[0] string] UTF8String]);
+                    VNRecognizedText *candidate = topCandidates[0];
+                    if (wordsJSON) {
+                        NSString *text = candidate.string;
+                        [text enumerateSubstringsInRange:NSMakeRange(0, text.length)
+                                                 options:NSStringEnumerationByWords
+                                              usingBlock:^(NSString *substring, NSRange substringRange, NSRange enclosingRange, BOOL *stop) {
+                            NSError *boxError = nil;
+                            VNRectangleObservation *box = [candidate boundingBoxForRange:substringRange error:&boxError];
+                            if (!box || boxError) return;
+                            CGRect bounds = box.boundingBox;
+                            double imageWidth = CGImageGetWidth(cgImage);
+                            double imageHeight = CGImageGetHeight(cgImage);
+                            [words addObject:@{
+                                @"text": substring,
+                                @"x": @(bounds.origin.x * imageWidth),
+                                @"y": @((1.0 - bounds.origin.y - bounds.size.height) * imageHeight),
+                                @"width": @(bounds.size.width * imageWidth),
+                                @"height": @(bounds.size.height * imageHeight)
+                            }];
+                        }];
+                    } else {
+                        printf("%s\n", [candidate.string UTF8String]);
+                    }
                 }
+            }
+            if (wordsJSON) {
+                NSData *json = [NSJSONSerialization dataWithJSONObject:words options:0 error:nil];
+                printf("%s\n", [[[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] UTF8String]);
             }
         }];
         

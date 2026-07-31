@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Windows.Graphics.Imaging;
 using Windows.Media.Ocr;
@@ -40,7 +42,22 @@ namespace OcrHelper
                         }
 
                         OcrResult result = await ocrEngine.RecognizeAsync(softwareBitmap);
-                        Console.WriteLine(result.Text);
+                        if (args.Length > 1 && args[1] == "--words-json")
+                        {
+                            var words = result.Lines.SelectMany(line => line.Words).Select(word => new
+                            {
+                                text = word.Text,
+                                x = word.BoundingRect.X,
+                                y = word.BoundingRect.Y,
+                                width = word.BoundingRect.Width,
+                                height = word.BoundingRect.Height
+                            });
+                            Console.WriteLine(JsonSerializer.Serialize(words));
+                        }
+                        else
+                        {
+                            Console.WriteLine(result.Text);
+                        }
                     }
                 }
             }
