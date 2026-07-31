@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Windows.Globalization;
 using Windows.Graphics.Imaging;
 using Windows.Media.Ocr;
 using Windows.Storage;
@@ -34,7 +35,11 @@ namespace OcrHelper
                     BitmapDecoder decoder = await BitmapDecoder.CreateAsync(stream);
                     using (SoftwareBitmap softwareBitmap = await decoder.GetSoftwareBitmapAsync())
                     {
-                        OcrEngine ocrEngine = OcrEngine.TryCreateFromUserProfileLanguages();
+                        Language? swedish = OcrEngine.AvailableRecognizerLanguages
+                            .FirstOrDefault(language => language.LanguageTag.StartsWith("sv", StringComparison.OrdinalIgnoreCase));
+                        OcrEngine ocrEngine = swedish != null
+                            ? OcrEngine.TryCreateFromLanguage(swedish)
+                            : OcrEngine.TryCreateFromUserProfileLanguages();
                         if (ocrEngine == null)
                         {
                             Console.Error.WriteLine("Error: Could not create OcrEngine (no languages installed?).");

@@ -67,6 +67,26 @@ pub fn focus_window(window_id: u32) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+pub fn verify_foreground_window(window_id: u32) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0 as usize as u32 == window_id {
+        Ok(())
+    } else {
+        Err(
+            "Ett annat fönster ligger framför målfönstret. RPA-flödet stoppades före inmatningen."
+                .to_string(),
+        )
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn verify_foreground_window(_window_id: u32) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 pub fn focus_window(window_id: u32) -> Result<(), String> {
     let window = Window::all()

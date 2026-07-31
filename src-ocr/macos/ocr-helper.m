@@ -71,6 +71,7 @@ int main(int argc, const char * argv[]) {
         
         request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
         request.usesLanguageCorrection = YES;
+        request.recognitionLanguages = @[@"sv-SE", @"en-US"];
         
         NSError *error = nil;
         [handler performRequests:@[request] error:&error];

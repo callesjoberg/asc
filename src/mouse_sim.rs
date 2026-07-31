@@ -1,4 +1,4 @@
-use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
+use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use rand::Rng;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -28,21 +28,54 @@ pub struct OcrSequenceConfig {
     pub window_id: u32,
     pub steps: Vec<AutomationStep>,
     pub repeat: bool,
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Shortcut {
+    Copy,
+    Paste,
+    SelectAll,
+    Enter,
+    Escape,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PointerButton {
+    Left,
+    Right,
 }
 
 #[derive(Clone, Debug)]
 pub enum AutomationStep {
+    SetTargetWindow(u32),
     Wait(Duration),
+    WaitForStable {
+        minimum: Duration,
+        stable_for: Duration,
+        timeout: Duration,
+        max_changed_fraction: f64,
+    },
     ClickOcrWord {
         word: String,
         timeout: Duration,
     },
     ClickImage {
-        image_path: String,
+        template: image::DynamicImage,
+        expected_area: (u32, u32, u32, u32),
+        reference_size: (u32, u32),
         timeout: Duration,
         confidence: f64,
+        position_tolerance: f64,
     },
+    ClickRelative {
+        x_fraction: f64,
+        y_fraction: f64,
+        button: PointerButton,
+    },
+    Shortcut(Shortcut),
     TypeText(String),
+    PauseForConfirmation(String),
 }
 
 #[derive(Debug)]
@@ -128,6 +161,12 @@ pub fn run(config: Config, control: Receiver<()>, events: Sender<Event>) {
 
         if let Err(error) = smooth_move(&mut enigo, target_x, target_y, &control, &mut rng) {
             let _ = events.send(Event::Stopped(error));
+            return;
+        }
+        // A stop request can arrive after the final movement step. Check once
+        // more immediately before the irreversible action.
+        if let Some(reason) = interrupted(&control, &enigo, Duration::ZERO) {
+            let _ = events.send(Event::Stopped(reason));
             return;
         }
         moves += 1;
@@ -225,9 +264,30 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
     let mut rng = rand::rng();
     let mut moves = 0_u64;
     let mut clicks = 0_u64;
+    let mut active_window_id = config.window_id;
 
     loop {
         for (step_index, step) in config.steps.iter().enumerate() {
+            if let AutomationStep::SetTargetWindow(window_id) = step {
+                active_window_id = *window_id;
+                let _ = events.send(Event::Activity {
+                    description: format!(
+                        "Steg {}: bytte målfönster för följande steg.",
+                        step_index + 1
+                    ),
+                    moves,
+                    clicks,
+                    typed_words: 0,
+                });
+                continue;
+            }
+            if let AutomationStep::PauseForConfirmation(message) = step {
+                let _ = events.send(Event::Stopped(format!(
+                    "Pausad för manuell bekräftelse: {}",
+                    message.trim()
+                )));
+                return;
+            }
             if let AutomationStep::Wait(duration) = step {
                 let _ = events.send(Event::Status(format!(
                     "Steg {}: väntar {} sekunder…",
@@ -240,19 +300,142 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                 }
                 continue;
             }
-            if let AutomationStep::TypeText(text) = step {
-                if let Some(reason) = activate_target(config.window_id, &control, &enigo) {
+            if let AutomationStep::WaitForStable {
+                minimum,
+                stable_for,
+                timeout,
+                max_changed_fraction,
+            } = step
+            {
+                if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
                     let _ = events.send(Event::Stopped(reason));
                     return;
                 }
-                if let Err(error) = enigo.text(text) {
-                    let _ = events.send(Event::Stopped(format!(
-                        "Textinmatning misslyckades: {error}"
-                    )));
+                let _ = events.send(Event::Status(format!(
+                    "Steg {}: väntar minst {} sekunder på att sidan ska bli klar…",
+                    step_index + 1,
+                    minimum.as_secs()
+                )));
+                if let Some(reason) = interrupted(&control, &enigo, *minimum) {
+                    let _ = events.send(Event::Stopped(reason));
                     return;
                 }
+
+                let stability_started = Instant::now();
+                let mut previous =
+                    match crate::capture::capture_source("window", active_window_id, None) {
+                        Ok(image) => image,
+                        Err(error) => {
+                            let _ = events.send(Event::Stopped(error));
+                            return;
+                        }
+                    };
+                let mut stable_since = None;
+                loop {
+                    if stability_started.elapsed() >= *timeout {
+                        let _ = events.send(Event::Stopped(format!(
+                            "Steg {}: sidan blev inte stabil inom {} sekunder efter minimitiden.",
+                            step_index + 1,
+                            timeout.as_secs()
+                        )));
+                        return;
+                    }
+                    if let Some(reason) = interrupted(&control, &enigo, Duration::from_millis(500))
+                    {
+                        let _ = events.send(Event::Stopped(reason));
+                        return;
+                    }
+                    let current =
+                        match crate::capture::capture_source("window", active_window_id, None) {
+                            Ok(image) => image,
+                            Err(error) => {
+                                let _ = events.send(Event::Stopped(error));
+                                return;
+                            }
+                        };
+                    let difference = crate::analysis::analyze_images(&previous, &current, 24);
+                    let pixel_count = u64::from(current.width()) * u64::from(current.height());
+                    let changed_fraction = if pixel_count == 0 {
+                        1.0
+                    } else {
+                        difference.changed_pixels as f64 / pixel_count as f64
+                    };
+                    if changed_fraction <= max_changed_fraction.clamp(0.0, 1.0) {
+                        let since = stable_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= *stable_for {
+                            let _ = events.send(Event::Activity {
+                                description: format!(
+                                    "Steg {}: sidan är stabil och flödet fortsätter.",
+                                    step_index + 1
+                                ),
+                                moves,
+                                clicks,
+                                typed_words: 0,
+                            });
+                            break;
+                        }
+                    } else {
+                        stable_since = None;
+                    }
+                    previous = current;
+                }
+                continue;
+            }
+            if let AutomationStep::Shortcut(shortcut) = step {
+                if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
+                    let _ = events.send(Event::Stopped(reason));
+                    return;
+                }
+                if let Some(reason) = interrupted(&control, &enigo, Duration::ZERO) {
+                    let _ = events.send(Event::Stopped(reason));
+                    return;
+                }
+                if !config.dry_run {
+                    if let Err(error) = send_shortcut(&mut enigo, *shortcut) {
+                        let _ = events.send(Event::Stopped(error));
+                        return;
+                    }
+                }
                 let _ = events.send(Event::Activity {
-                    description: format!("Steg {}: skrev text.", step_index + 1),
+                    description: format!(
+                        "Steg {}: {}kortkommandot {}.",
+                        step_index + 1,
+                        if config.dry_run {
+                            "verifierade "
+                        } else {
+                            "skickade "
+                        },
+                        shortcut_label(*shortcut)
+                    ),
+                    moves,
+                    clicks,
+                    typed_words: 0,
+                });
+                continue;
+            }
+            if let AutomationStep::TypeText(text) = step {
+                if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
+                    let _ = events.send(Event::Stopped(reason));
+                    return;
+                }
+                if !config.dry_run {
+                    if let Err(error) = enigo.text(text) {
+                        let _ = events.send(Event::Stopped(format!(
+                            "Textinmatning misslyckades: {error}"
+                        )));
+                        return;
+                    }
+                }
+                let _ = events.send(Event::Activity {
+                    description: format!(
+                        "Steg {}: {} textinmatning.",
+                        step_index + 1,
+                        if config.dry_run {
+                            "verifierade"
+                        } else {
+                            "utförde"
+                        }
+                    ),
                     moves,
                     clicks,
                     typed_words: text.split_whitespace().count() as u64,
@@ -262,28 +445,89 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
             let (target_label, timeout, template) = match step {
                 AutomationStep::ClickOcrWord { word, timeout } => (word.clone(), *timeout, None),
                 AutomationStep::ClickImage {
-                    image_path,
+                    template,
+                    expected_area,
+                    reference_size,
                     timeout,
                     confidence,
+                    position_tolerance,
+                } => (
+                    format!("bild ({:.0} %)", confidence * 100.0),
+                    *timeout,
+                    Some((
+                        template.clone(),
+                        *confidence,
+                        *expected_area,
+                        *reference_size,
+                        *position_tolerance,
+                    )),
+                ),
+                AutomationStep::ClickRelative {
+                    x_fraction,
+                    y_fraction,
+                    button,
                 } => {
-                    let image = match image::open(image_path) {
-                        Ok(image) => image,
+                    if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
+                        let _ = events.send(Event::Stopped(reason));
+                        return;
+                    }
+                    let geometry = match crate::capture::window_geometry(active_window_id) {
+                        Ok(geometry) => geometry,
                         Err(error) => {
-                            let _ = events.send(Event::Stopped(format!(
-                                "Kunde inte öppna referensbilden {image_path}: {error}"
-                            )));
+                            let _ = events.send(Event::Stopped(error));
                             return;
                         }
                     };
-                    (
-                        format!("bild ({:.0} %)", confidence * 100.0),
-                        *timeout,
-                        Some((image, *confidence)),
-                    )
+                    let (target_x, target_y) =
+                        relative_window_point(geometry, *x_fraction, *y_fraction);
+                    if !config.dry_run {
+                        if let Err(error) =
+                            smooth_move(&mut enigo, target_x, target_y, &control, &mut rng)
+                        {
+                            let _ = events.send(Event::Stopped(error));
+                            return;
+                        }
+                        if let Some(reason) = interrupted(&control, &enigo, Duration::ZERO) {
+                            let _ = events.send(Event::Stopped(reason));
+                            return;
+                        }
+                        let enigo_button = match button {
+                            PointerButton::Left => Button::Left,
+                            PointerButton::Right => Button::Right,
+                        };
+                        if let Err(error) = enigo.button(enigo_button, Direction::Click) {
+                            let _ =
+                                events.send(Event::Stopped(format!("Klick misslyckades: {error}")));
+                            return;
+                        }
+                        moves += 1;
+                        clicks += 1;
+                    }
+                    let _ = events.send(Event::Activity {
+                        description: format!(
+                            "Steg {}: {} {}klick vid {:.1} %, {:.1} % i målfönstret.",
+                            step_index + 1,
+                            if config.dry_run {
+                                "verifierade"
+                            } else {
+                                "utförde"
+                            },
+                            match button {
+                                PointerButton::Left => "vänster",
+                                PointerButton::Right => "höger",
+                            },
+                            x_fraction * 100.0,
+                            y_fraction * 100.0
+                        ),
+                        moves,
+                        clicks,
+                        typed_words: 0,
+                    });
+                    continue;
                 }
                 _ => continue,
             };
-            if let Some(reason) = activate_target(config.window_id, &control, &enigo) {
+            if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
                 let _ = events.send(Event::Stopped(reason));
                 return;
             }
@@ -300,7 +544,7 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                     return;
                 }
 
-                let image = match crate::capture::capture_source("window", config.window_id, None) {
+                let image = match crate::capture::capture_source("window", active_window_id, None) {
                     Ok(image) => image,
                     Err(error) => {
                         let _ = events.send(Event::Stopped(format!(
@@ -309,8 +553,8 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                         return;
                     }
                 };
-                let found = if let Some((template, confidence)) = &template {
-                    find_image_target(&image, template, *confidence)
+                let found = if let Some((template, confidence, area, size, tolerance)) = &template {
+                    find_image_target(&image, template, *confidence, *area, *size, *tolerance)
                 } else {
                     let temp_path = std::env::temp_dir().join(format!(
                         "asc-ocr-sequence-{}-{}.png",
@@ -347,11 +591,11 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                 }
             };
 
-            if let Some(reason) = activate_target(config.window_id, &control, &enigo) {
+            if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
                 let _ = events.send(Event::Stopped(reason));
                 return;
             }
-            let geometry = match crate::capture::window_geometry(config.window_id) {
+            let geometry = match crate::capture::window_geometry(active_window_id) {
                 Ok(geometry) => geometry,
                 Err(error) => {
                     let _ = events.send(Event::Stopped(error));
@@ -364,20 +608,34 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                 + (center_x / f64::from(word.1) * f64::from(geometry.width)).round() as i32;
             let target_y = geometry.y
                 + (center_y / f64::from(word.2) * f64::from(geometry.height)).round() as i32;
-            if let Err(error) = smooth_move(&mut enigo, target_x, target_y, &control, &mut rng) {
-                let _ = events.send(Event::Stopped(error));
-                return;
+            if !config.dry_run {
+                if let Err(error) = smooth_move(&mut enigo, target_x, target_y, &control, &mut rng)
+                {
+                    let _ = events.send(Event::Stopped(error));
+                    return;
+                }
+                // Do not click if a stop request arrived while the pointer was
+                // settling on the target.
+                if let Some(reason) = interrupted(&control, &enigo, Duration::ZERO) {
+                    let _ = events.send(Event::Stopped(reason));
+                    return;
+                }
+                moves += 1;
+                if let Err(error) = enigo.button(Button::Left, Direction::Click) {
+                    let _ = events.send(Event::Stopped(format!("Klick misslyckades: {error}")));
+                    return;
+                }
+                clicks += 1;
             }
-            moves += 1;
-            if let Err(error) = enigo.button(Button::Left, Direction::Click) {
-                let _ = events.send(Event::Stopped(format!("Klick misslyckades: {error}")));
-                return;
-            }
-            clicks += 1;
             let _ = events.send(Event::Activity {
                 description: format!(
-                    "Steg {}: klickade på OCR-ordet ‘{}’.",
+                    "Steg {}: {} målet ‘{}’.",
                     step_index + 1,
+                    if config.dry_run {
+                        "hittade"
+                    } else {
+                        "klickade på"
+                    },
                     word.0.text
                 ),
                 moves,
@@ -387,36 +645,122 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
         }
 
         if !config.repeat {
-            let _ = events.send(Event::Stopped("OCR-klicksekvensen är klar.".to_string()));
+            let _ = events.send(Event::Stopped(if config.dry_run {
+                "Torrkörningen är klar. Inga klick eller textinmatningar utfördes.".to_string()
+            } else {
+                "RPA-sekvensen är klar.".to_string()
+            }));
             return;
         }
     }
+}
+
+fn shortcut_label(shortcut: Shortcut) -> &'static str {
+    match shortcut {
+        Shortcut::Copy => "Kopiera",
+        Shortcut::Paste => "Klistra in",
+        Shortcut::SelectAll => "Markera allt",
+        Shortcut::Enter => "Enter",
+        Shortcut::Escape => "Escape",
+    }
+}
+
+fn relative_window_point(
+    geometry: crate::capture::WindowGeometry,
+    x_fraction: f64,
+    y_fraction: f64,
+) -> (i32, i32) {
+    (
+        geometry.x + (x_fraction.clamp(0.0, 1.0) * f64::from(geometry.width)).round() as i32,
+        geometry.y + (y_fraction.clamp(0.0, 1.0) * f64::from(geometry.height)).round() as i32,
+    )
+}
+
+fn send_shortcut(enigo: &mut Enigo, shortcut: Shortcut) -> Result<(), String> {
+    let single_key = match shortcut {
+        Shortcut::Enter => Some(Key::Return),
+        Shortcut::Escape => Some(Key::Escape),
+        _ => None,
+    };
+    if let Some(key) = single_key {
+        return enigo
+            .key(key, Direction::Click)
+            .map_err(|error| format!("Kortkommandot misslyckades: {error}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    let modifier = Key::Meta;
+    #[cfg(not(target_os = "macos"))]
+    let modifier = Key::Control;
+    let character = match shortcut {
+        Shortcut::Copy => 'c',
+        Shortcut::Paste => 'v',
+        Shortcut::SelectAll => 'a',
+        Shortcut::Enter | Shortcut::Escape => unreachable!(),
+    };
+
+    enigo
+        .key(modifier, Direction::Press)
+        .map_err(|error| format!("Kortkommandot misslyckades: {error}"))?;
+    let result = enigo.key(Key::Unicode(character), Direction::Click);
+    let release_result = enigo.key(modifier, Direction::Release);
+    result
+        .and(release_result)
+        .map_err(|error| format!("Kortkommandot misslyckades: {error}"))
 }
 
 fn activate_target(window_id: u32, control: &Receiver<()>, enigo: &Enigo) -> Option<String> {
     if let Err(error) = crate::capture::focus_window(window_id) {
         return Some(format!("Kunde inte aktivera målfönstret: {error}"));
     }
-    interrupted(control, enigo, Duration::from_millis(350))
+    if let Some(reason) = interrupted(control, enigo, Duration::from_millis(350)) {
+        return Some(reason);
+    }
+    crate::capture::verify_foreground_window(window_id).err()
 }
 
 fn find_image_target(
     source: &image::DynamicImage,
     template: &image::DynamicImage,
     confidence: f64,
+    expected_area: (u32, u32, u32, u32),
+    reference_size: (u32, u32),
+    position_tolerance: f64,
 ) -> Option<crate::ocr::OcrWord> {
-    let template_width = template.width();
-    let template_height = template.height();
-    if template_width == 0
-        || template_height == 0
-        || template_width > source.width()
-        || template_height > source.height()
+    if template.width() == 0
+        || template.height() == 0
+        || reference_size.0 == 0
+        || reference_size.1 == 0
     {
         return None;
     }
 
+    let width_scale = source.width() as f64 / f64::from(reference_size.0);
+    let height_scale = source.height() as f64 / f64::from(reference_size.1);
+    let expected_x = (f64::from(expected_area.0) * width_scale).round() as u32;
+    let expected_y = (f64::from(expected_area.1) * height_scale).round() as u32;
+    let template_width = (f64::from(expected_area.2) * width_scale).round().max(1.0) as u32;
+    let template_height = (f64::from(expected_area.3) * height_scale).round().max(1.0) as u32;
+    if template_width > source.width() || template_height > source.height() {
+        return None;
+    }
+    let resized_template = image::DynamicImage::ImageRgba8(image::imageops::resize(
+        &template.to_rgba8(),
+        template_width,
+        template_height,
+        image::imageops::FilterType::Triangle,
+    ));
+
     // Matcha på en mindre gråskalebild för att hålla sökningen snabb även i stora fönster.
-    let scale = template_width.max(template_height).div_ceil(48).max(1);
+    let minimum_scale = if template_width.min(template_height) >= 8 {
+        2
+    } else {
+        1
+    };
+    let scale = template_width
+        .max(template_height)
+        .div_ceil(48)
+        .max(minimum_scale);
     let source_small = image::imageops::resize(
         &source.to_luma8(),
         (source.width() / scale).max(1),
@@ -424,7 +768,7 @@ fn find_image_target(
         image::imageops::FilterType::Triangle,
     );
     let template_small = image::imageops::resize(
-        &template.to_luma8(),
+        &resized_template.to_luma8(),
         (template_width / scale).max(1),
         (template_height / scale).max(1),
         image::imageops::FilterType::Triangle,
@@ -440,8 +784,17 @@ fn find_image_target(
         ((1.0 - confidence.clamp(0.0, 1.0)) * 255.0 * sample_count as f64).round() as u64;
     let mut best = None;
     let mut best_error = maximum_error.saturating_add(1);
-    for y in 0..=source_small.height() - template_small.height() {
-        for x in 0..=source_small.width() - template_small.width() {
+    let tolerance = position_tolerance.clamp(0.0, 1.0);
+    let tolerance_x = (f64::from(source.width()) * tolerance).round() as u32;
+    let tolerance_y = (f64::from(source.height()) * tolerance).round() as u32;
+    let valid_x_max = source.width() - template_width;
+    let valid_y_max = source.height() - template_height;
+    let search_x_min = expected_x.saturating_sub(tolerance_x).min(valid_x_max) / scale;
+    let search_y_min = expected_y.saturating_sub(tolerance_y).min(valid_y_max) / scale;
+    let search_x_max = expected_x.saturating_add(tolerance_x).min(valid_x_max) / scale;
+    let search_y_max = expected_y.saturating_add(tolerance_y).min(valid_y_max) / scale;
+    for y in search_y_min..=search_y_max {
+        for x in search_x_min..=search_x_max {
             let mut error = 0_u64;
             'pixels: for ty in 0..template_small.height() {
                 for tx in 0..template_small.width() {
@@ -674,7 +1027,10 @@ fn is_emergency_corner(x: i32, y: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_image_target, find_ocr_target, is_emergency_corner, random_duration};
+    use super::{
+        find_image_target, find_ocr_target, is_emergency_corner, normalize_ocr_token,
+        random_duration, relative_window_point,
+    };
     use image::{DynamicImage, ImageBuffer, Rgba};
     use std::time::Duration;
 
@@ -695,6 +1051,18 @@ mod tests {
         assert!(!is_emergency_corner(4, 3));
         assert!(!is_emergency_corner(-1, -1));
         assert!(!is_emergency_corner(100, 100));
+    }
+
+    #[test]
+    fn recorded_clicks_follow_window_move_and_resize() {
+        let geometry = crate::capture::WindowGeometry {
+            x: 100,
+            y: 50,
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(relative_window_point(geometry, 0.25, 0.75), (300, 500));
+        assert_eq!(relative_window_point(geometry, -1.0, 2.0), (100, 650));
     }
 
     #[test]
@@ -725,11 +1093,21 @@ mod tests {
     }
 
     #[test]
+    fn ocr_normalization_preserves_swedish_letters() {
+        assert_eq!(
+            normalize_ocr_token("  \u{201e}\u{00c5}tg\u{00e4}rder,\u{201d} "),
+            "\u{00e5}tg\u{00e4}rder"
+        );
+        assert_eq!(normalize_ocr_token("F\u{00d6}NSTER"), "f\u{00f6}nster");
+    }
+
+    #[test]
     fn image_target_finds_reference_inside_window_capture() {
         let mut source = ImageBuffer::from_pixel(20, 20, Rgba([0, 0, 0, 255]));
         let template =
             ImageBuffer::from_fn(4, 3, |x, y| Rgba([(x * 40 + y * 20 + 40) as u8, 0, 0, 255]));
         for (x, y, pixel) in template.enumerate_pixels() {
+            source.put_pixel(x + 1, y + 1, *pixel);
             source.put_pixel(x + 7, y + 9, *pixel);
         }
 
@@ -737,6 +1115,9 @@ mod tests {
             &DynamicImage::ImageRgba8(source),
             &DynamicImage::ImageRgba8(template),
             0.99,
+            (7, 9, 4, 3),
+            (20, 20),
+            0.10,
         )
         .expect("reference should be found");
         assert_eq!((target.x, target.y), (7.0, 9.0));

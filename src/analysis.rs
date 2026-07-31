@@ -1,10 +1,38 @@
 use image::{DynamicImage, GenericImageView};
 use std::collections::VecDeque;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ChangeBounds {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ChangeBounds {
+    fn include(&mut self, x: u32, y: u32) {
+        let right = (self.x + self.width).max(x + 1);
+        let bottom = (self.y + self.height).max(y + 1);
+        self.x = self.x.min(x);
+        self.y = self.y.min(y);
+        self.width = right - self.x;
+        self.height = bottom - self.y;
+    }
+
+    fn union(&mut self, other: Self) {
+        if other.width == 0 || other.height == 0 {
+            return;
+        }
+        self.include(other.x, other.y);
+        self.include(other.x + other.width - 1, other.y + other.height - 1);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Difference {
     pub average: f64,
     pub changed_pixels: u64,
+    pub bounds: Option<ChangeBounds>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -124,6 +152,12 @@ pub fn analyze_images(img1: &DynamicImage, img2: &DynamicImage, color_delta: u8)
         return Difference {
             average: 1.0,
             changed_pixels: u64::from(w1.max(w2)) * u64::from(h1.max(h2)),
+            bounds: Some(ChangeBounds {
+                x: 0,
+                y: 0,
+                width: w1.max(w2),
+                height: h1.max(h2),
+            }),
         };
     }
 
@@ -133,6 +167,7 @@ pub fn analyze_images(img1: &DynamicImage, img2: &DynamicImage, color_delta: u8)
     let mut diff_sum: u64 = 0;
     let mut pixels_count: u64 = 0;
     let mut changed_pixels: u64 = 0;
+    let mut bounds: Option<ChangeBounds> = None;
     let color_delta = u32::from(color_delta.max(1));
 
     for y in 0..common_height {
@@ -147,6 +182,16 @@ pub fn analyze_images(img1: &DynamicImage, img2: &DynamicImage, color_delta: u8)
             diff_sum += (r_diff + g_diff + b_diff) as u64;
             if r_diff.max(g_diff).max(b_diff) >= color_delta {
                 changed_pixels += 1;
+                if let Some(bounds) = &mut bounds {
+                    bounds.include(x, y);
+                } else {
+                    bounds = Some(ChangeBounds {
+                        x,
+                        y,
+                        width: 1,
+                        height: 1,
+                    });
+                }
             }
             pixels_count += 1;
         }
@@ -156,6 +201,15 @@ pub fn analyze_images(img1: &DynamicImage, img2: &DynamicImage, color_delta: u8)
     let total_pixels = std::cmp::max(w1 * h1, w2 * h2) as u64;
     let size_diff_pixels = total_pixels - pixels_count;
     changed_pixels += size_diff_pixels;
+    if size_diff_pixels > 0 {
+        // När storleken ändras är det säkrast att markera hela den nya/gemensamma ytan.
+        bounds = Some(ChangeBounds {
+            x: 0,
+            y: 0,
+            width: w1.max(w2),
+            height: h1.max(h2),
+        });
+    }
 
     // För pixlar som saknas i det överlappande området räknar vi maximal RGB-skillnad.
     diff_sum += size_diff_pixels * 765;
@@ -165,12 +219,14 @@ pub fn analyze_images(img1: &DynamicImage, img2: &DynamicImage, color_delta: u8)
         return Difference {
             average: 0.0,
             changed_pixels,
+            bounds,
         };
     }
 
     Difference {
         average: (diff_sum as f64) / (max_possible_diff as f64),
         changed_pixels,
+        bounds,
     }
 }
 
@@ -187,6 +243,7 @@ pub fn analyze_regions(
     let mut weighted_average = 0.0;
     let mut total_pixels = 0_u64;
     let mut changed_pixels = 0_u64;
+    let mut bounds: Option<ChangeBounds> = None;
     for &region in regions {
         let first = crate::capture::crop_image(img1, region);
         let second = crate::capture::crop_image(img2, region);
@@ -196,6 +253,15 @@ pub fn analyze_regions(
         weighted_average += difference.average * pixels as f64;
         total_pixels += pixels;
         changed_pixels += difference.changed_pixels;
+        if let Some(mut region_bounds) = difference.bounds {
+            region_bounds.x += region.0;
+            region_bounds.y += region.1;
+            if let Some(bounds) = &mut bounds {
+                bounds.union(region_bounds);
+            } else {
+                bounds = Some(region_bounds);
+            }
+        }
     }
 
     Difference {
@@ -205,6 +271,7 @@ pub fn analyze_regions(
             weighted_average / total_pixels as f64
         },
         changed_pixels,
+        bounds,
     }
 }
 
@@ -278,6 +345,32 @@ mod tests {
         let img2 = DynamicImage::ImageRgba8(buffer);
 
         assert!((compare_images(&img1, &img2) - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn changed_pixels_have_a_tight_bounding_box() {
+        let img1 = create_mock_image(12, 10, Rgba([0, 0, 0, 255]));
+        let mut buffer = img1.to_rgba8();
+        buffer.put_pixel(3, 2, Rgba([255, 255, 255, 255]));
+        buffer.put_pixel(7, 6, Rgba([255, 255, 255, 255]));
+        let difference = analyze_images(&img1, &DynamicImage::ImageRgba8(buffer), 24);
+
+        assert_eq!(difference.changed_pixels, 2);
+        assert_eq!(
+            difference.bounds,
+            Some(ChangeBounds {
+                x: 3,
+                y: 2,
+                width: 5,
+                height: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn unchanged_images_have_no_change_bounds() {
+        let image = create_mock_image(4, 4, Rgba([12, 34, 56, 255]));
+        assert_eq!(analyze_images(&image, &image, 24).bounds, None);
     }
 
     #[test]

@@ -49,8 +49,11 @@ fn run_helper(image_path: &str, words_json: bool) -> Result<String, String> {
         binary_name
     ));
 
-    // Om filen inte redan ligger där, eller om vi vill säkerställa att den är uppdaterad, skriv ut den
-    if !helper_path.exists() {
+    // Skriv om hjälparen om de inbäddade bytesen har ändrats, även inom samma utvecklingsversion.
+    let helper_is_current = fs::read(&helper_path)
+        .map(|existing| existing == OCR_HELPER_BYTES)
+        .unwrap_or(false);
+    if !helper_is_current {
         fs::write(&helper_path, OCR_HELPER_BYTES).map_err(|e| {
             format!(
                 "Kunde inte skriva OCR-hjälpprogram till temp-katalog: {}",

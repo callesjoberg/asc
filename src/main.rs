@@ -2,8 +2,10 @@
 
 mod analysis;
 mod capture;
+mod macro_recorder;
 mod mouse_sim;
 mod ocr;
+mod presence;
 
 use chrono::Local;
 use eframe::egui;
@@ -19,6 +21,8 @@ struct LogItem {
     timestamp: String,
     pixel_diff: f64,
     changed_pixels: u64,
+    change_bounds: Option<analysis::ChangeBounds>,
+    change_summary: String,
     ocr_text: String,
     is_changed: bool,
     file_name: String,
@@ -33,8 +37,21 @@ struct KeywordColorResult {
     ocr_text: String,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct PresencePeriod {
+    person: String,
+    status: presence::PresenceStatus,
+    started_at: String,
+    ended_at: Option<String>,
+    duration_seconds: u64,
+}
+
 enum ControlMessage {
     Stop,
+}
+
+fn stop_requested(control_rx: &Receiver<ControlMessage>) -> bool {
+    matches!(control_rx.try_recv(), Ok(ControlMessage::Stop))
 }
 
 enum WorkerMessage {
@@ -49,17 +66,77 @@ enum WorkerMessage {
 struct AutomationStepEditor {
     kind: String,
     value: String,
+    target_window_id: u32,
     seconds: u64,
+    timeout_seconds: u64,
     confidence: f64,
+    template_image: Option<image::DynamicImage>,
+    expected_area: Option<(u32, u32, u32, u32)>,
+    reference_size: Option<(u32, u32)>,
+    relative_x: f64,
+    relative_y: f64,
+    click_button: String,
+    delay_ms: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegionKind {
+    Screenshot,
+    Ocr,
+    Measurement,
+}
+
+#[derive(Clone, Copy)]
+enum ResizeCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Clone, Copy)]
+struct RegionInteraction {
+    kind: RegionKind,
+    index: usize,
+    original: (u32, u32, u32, u32),
+    start: egui::Pos2,
+    resize: Option<ResizeCorner>,
 }
 
 impl AutomationStepEditor {
+    fn basic(kind: &str, value: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            value: value.to_string(),
+            target_window_id: 0,
+            seconds: 0,
+            timeout_seconds: 60,
+            confidence: 90.0,
+            template_image: None,
+            expected_area: None,
+            reference_size: None,
+            relative_x: 0.5,
+            relative_y: 0.5,
+            click_button: "left".to_string(),
+            delay_ms: 0,
+        }
+    }
+
     fn click_word() -> Self {
         Self {
             kind: "click_word".to_string(),
             value: String::new(),
+            target_window_id: 0,
             seconds: 30,
+            timeout_seconds: 60,
             confidence: 90.0,
+            template_image: None,
+            expected_area: None,
+            reference_size: None,
+            relative_x: 0.5,
+            relative_y: 0.5,
+            click_button: "left".to_string(),
+            delay_ms: 0,
         }
     }
 
@@ -67,9 +144,59 @@ impl AutomationStepEditor {
         Self {
             kind: "wait".to_string(),
             value: String::new(),
+            target_window_id: 0,
             seconds: 3,
+            timeout_seconds: 60,
             confidence: 90.0,
+            template_image: None,
+            expected_area: None,
+            reference_size: None,
+            relative_x: 0.5,
+            relative_y: 0.5,
+            click_button: "left".to_string(),
+            delay_ms: 0,
         }
+    }
+
+    fn image_target(label: &str) -> Self {
+        let mut step = Self::basic("click_image", label);
+        step.seconds = 30;
+        step.confidence = 85.0;
+        step
+    }
+
+    fn wait_ready(minimum_seconds: u64) -> Self {
+        let mut step = Self::basic("wait_ready", "");
+        step.seconds = minimum_seconds;
+        step
+    }
+
+    fn shortcut(value: &str) -> Self {
+        Self::basic("shortcut", value)
+    }
+
+    fn switch_window(window_id: u32) -> Self {
+        let mut step = Self::basic("switch_window", "");
+        step.target_window_id = window_id;
+        step
+    }
+
+    fn recorded_wait(delay_ms: u64) -> Self {
+        let mut step = Self::basic("wait_recorded", "");
+        step.delay_ms = delay_ms;
+        step
+    }
+
+    fn recorded_click(x: f32, y: f32, button: macro_recorder::RecordedMouseButton) -> Self {
+        let mut step = Self::basic("click_relative", "");
+        step.relative_x = f64::from(x);
+        step.relative_y = f64::from(y);
+        step.click_button = match button {
+            macro_recorder::RecordedMouseButton::Left => "left",
+            macro_recorder::RecordedMouseButton::Right => "right",
+        }
+        .to_string();
+        step
     }
 }
 
@@ -112,6 +239,10 @@ struct AscApp {
     region_editor_active: bool,
     region_editor_kind: String,
     region_drag_start: Option<egui::Pos2>,
+    region_selected: Option<(RegionKind, usize)>,
+    region_interaction: Option<RegionInteraction>,
+    region_result_preview: bool,
+    region_source_image: Option<image::DynamicImage>,
     region_source_type: String,
     region_source_id: Option<u32>,
     region_source_size: Option<[usize; 2]>,
@@ -140,6 +271,7 @@ struct AscApp {
     preview_pan: egui::Vec2,
     follow_latest_preview: bool,
     selected_preview_file: Option<String>,
+    preview_change_bounds: Option<analysis::ChangeBounds>,
 
     // Trådkommunikation
     log_receiver: Option<Receiver<WorkerMessage>>,
@@ -179,9 +311,32 @@ struct AscApp {
     automation_window_id: u32,
     automation_steps: Vec<AutomationStepEditor>,
     automation_repeat: bool,
+    automation_dry_run: bool,
     automation_receiver: Option<Receiver<mouse_sim::Event>>,
     automation_control_sender: Option<Sender<()>>,
-    automation_image_picker_receiver: Option<Receiver<Option<(usize, String)>>>,
+    automation_recorder: Option<macro_recorder::MacroRecorder>,
+    automation_picker_step: Option<usize>,
+    automation_picker_image: Option<image::DynamicImage>,
+    automation_picker_texture: Option<egui::TextureHandle>,
+    automation_picker_size: Option<[usize; 2]>,
+    automation_picker_drag_start: Option<egui::Pos2>,
+    automation_picker_selection: Option<(u32, u32, u32, u32)>,
+
+    // Teams-status
+    presence_running: bool,
+    presence_status_text: String,
+    presence_window_id: u32,
+    presence_person: String,
+    presence_interval_secs: u64,
+    presence_ocr_area: Option<(u32, u32, u32, u32)>,
+    presence_color_area: Option<(u32, u32, u32, u32)>,
+    presence_current_status: Option<presence::PresenceStatus>,
+    presence_current_started: Option<Instant>,
+    presence_periods: Vec<PresencePeriod>,
+    presence_last_ocr: String,
+    presence_receiver: Option<Receiver<presence::Event>>,
+    presence_control_sender: Option<Sender<()>>,
+    presence_region_setup_pending: bool,
 }
 
 impl Default for AscApp {
@@ -223,6 +378,10 @@ impl Default for AscApp {
             region_editor_active: false,
             region_editor_kind: "screenshot".to_string(),
             region_drag_start: None,
+            region_selected: None,
+            region_interaction: None,
+            region_result_preview: false,
+            region_source_image: None,
             region_source_type: String::new(),
             region_source_id: None,
             region_source_size: None,
@@ -245,6 +404,7 @@ impl Default for AscApp {
             preview_pan: egui::Vec2::ZERO,
             follow_latest_preview: true,
             selected_preview_file: None,
+            preview_change_bounds: None,
             log_receiver: None,
             control_sender: None,
             folder_receiver: None,
@@ -281,13 +441,35 @@ impl Default for AscApp {
                 AutomationStepEditor::wait(),
             ],
             automation_repeat: false,
+            automation_dry_run: true,
             automation_receiver: None,
             automation_control_sender: None,
-            automation_image_picker_receiver: None,
+            automation_recorder: None,
+            automation_picker_step: None,
+            automation_picker_image: None,
+            automation_picker_texture: None,
+            automation_picker_size: None,
+            automation_picker_drag_start: None,
+            automation_picker_selection: None,
+            presence_running: false,
+            presence_status_text: "Klar att starta".to_string(),
+            presence_window_id: 0,
+            presence_person: String::new(),
+            presence_interval_secs: 5,
+            presence_ocr_area: None,
+            presence_color_area: None,
+            presence_current_status: None,
+            presence_current_started: None,
+            presence_periods: Vec::new(),
+            presence_last_ocr: String::new(),
+            presence_receiver: None,
+            presence_control_sender: None,
+            presence_region_setup_pending: false,
         };
         app.refresh_sources();
         app.automation_window_id = app.windows.first().map(|window| window.id).unwrap_or(0);
         app.mouse_typing_window_id = app.windows.first().map(|window| window.id).unwrap_or(0);
+        app.presence_window_id = app.windows.first().map(|window| window.id).unwrap_or(0);
         app
     }
 }
@@ -299,6 +481,31 @@ impl AscApp {
         }
 
         write_analysis(Path::new(&self.save_dir), &self.logs, &self.keyword_results)
+    }
+
+    fn export_presence(&self) -> Result<(), String> {
+        if self.save_dir.is_empty() {
+            return Ok(());
+        }
+        let directory = Path::new(&self.save_dir);
+        let json = serde_json::to_string_pretty(&self.presence_periods)
+            .map_err(|error| format!("Kunde inte skapa Teams JSON: {error}"))?;
+        fs::write(directory.join("teams-status.json"), json)
+            .map_err(|error| format!("Kunde inte skriva teams-status.json: {error}"))?;
+        let mut csv = String::from("person,status,start,slut,varaktighet_sekunder\n");
+        for period in &self.presence_periods {
+            let _ = writeln!(
+                csv,
+                "{},{},{},{},{}",
+                csv_field(&period.person),
+                csv_field(period.status.label()),
+                csv_field(&period.started_at),
+                csv_field(period.ended_at.as_deref().unwrap_or("")),
+                period.duration_seconds
+            );
+        }
+        fs::write(directory.join("teams-status.csv"), csv)
+            .map_err(|error| format!("Kunde inte skriva teams-status.csv: {error}"))
     }
 
     fn refresh_sources(&mut self) {
@@ -331,6 +538,10 @@ impl AscApp {
         self.measurement_regions.clear();
         self.region_editor_active = false;
         self.region_drag_start = None;
+        self.region_selected = None;
+        self.region_interaction = None;
+        self.region_result_preview = false;
+        self.region_source_image = None;
         self.region_source_type.clear();
         self.region_source_id = None;
         self.region_source_size = None;
@@ -338,6 +549,62 @@ impl AscApp {
 
     fn has_visual_regions(&self) -> bool {
         self.enable_crop || !self.ocr_regions.is_empty() || !self.measurement_regions.is_empty()
+    }
+
+    fn set_region_value(&mut self, kind: RegionKind, index: usize, area: (u32, u32, u32, u32)) {
+        match kind {
+            RegionKind::Screenshot => {
+                self.enable_crop = true;
+                (self.crop_x, self.crop_y, self.crop_w, self.crop_h) = area;
+            }
+            RegionKind::Ocr => {
+                if let Some(region) = self.ocr_regions.get_mut(index) {
+                    *region = area;
+                }
+            }
+            RegionKind::Measurement => {
+                if let Some(region) = self.measurement_regions.get_mut(index) {
+                    *region = area;
+                }
+                if index == 0 {
+                    (
+                        self.indicator_x,
+                        self.indicator_y,
+                        self.indicator_w,
+                        self.indicator_h,
+                    ) = area;
+                }
+            }
+        }
+    }
+
+    fn show_region_result(&mut self, ctx: &egui::Context) {
+        let Some(source) = self.region_source_image.clone() else {
+            return;
+        };
+        let result = if self.enable_crop {
+            capture::crop_image(
+                &source,
+                (self.crop_x, self.crop_y, self.crop_w, self.crop_h),
+            )
+        } else {
+            source
+        };
+        self.display_preview_image(result, "Färdigt skärmklippsresultat".to_string(), ctx);
+        self.region_editor_active = false;
+        self.region_result_preview = true;
+        self.region_drag_start = None;
+        self.region_interaction = None;
+        self.status_text = "Visar exakt det område som kommer att skärmklippas.".to_string();
+    }
+
+    fn return_to_region_editor(&mut self, ctx: &egui::Context) {
+        if let Some(source) = self.region_source_image.clone() {
+            self.display_preview_image(source, "Områdesväljare".to_string(), ctx);
+            self.region_editor_active = true;
+            self.region_result_preview = false;
+            self.status_text = "Justera markeringarna och välj OK igen.".to_string();
+        }
     }
 
     fn start_monitoring(&mut self, ctx: egui::Context) {
@@ -378,6 +645,7 @@ impl AscApp {
         self.preview_pan = egui::Vec2::ZERO;
         self.follow_latest_preview = true;
         self.selected_preview_file = None;
+        self.preview_change_bounds = None;
 
         let (log_tx, log_rx) = channel();
         let (control_tx, control_rx) = channel();
@@ -464,6 +732,7 @@ impl AscApp {
                         // Beräkna bildskillnad
                         let mut diff = 0.0;
                         let mut changed_pixels = 0;
+                        let mut change_bounds = None;
                         if let Some(ref p_img) = prev_img {
                             let difference = if measurement_regions.is_empty() {
                                 analysis::analyze_images(p_img, &img, small_change_color_delta)
@@ -477,6 +746,7 @@ impl AscApp {
                             };
                             diff = difference.average;
                             changed_pixels = difference.changed_pixels;
+                            change_bounds = difference.bounds;
                         }
 
                         // OCR (Textigenkänning)
@@ -558,6 +828,12 @@ impl AscApp {
                             timestamp,
                             pixel_diff: diff,
                             changed_pixels,
+                            change_summary: change_summary(
+                                changed_pixels,
+                                change_bounds,
+                                ocr_changed,
+                            ),
+                            change_bounds,
                             ocr_text,
                             is_changed,
                             file_name,
@@ -598,6 +874,15 @@ impl AscApp {
         self.status_text = "Avslutad".to_string();
         self.log_receiver = None;
         self.control_sender = None;
+    }
+
+    fn stop_offline_analysis(&mut self) {
+        if let Some(sender) = self.control_sender.as_ref() {
+            let _ = sender.send(ControlMessage::Stop);
+        }
+        // Låt worker-tråden avsluta själv så att redan beräknade meddelanden hinner tas emot
+        // och exporteras innan gränssnittet återgår till viloläge.
+        self.status_text = "Avbryter efterhandsanalysen…".to_string();
     }
 
     fn apply_live_settings(&mut self, ctx: egui::Context) {
@@ -654,9 +939,12 @@ impl AscApp {
         self.preview_pan = egui::Vec2::ZERO;
         self.follow_latest_preview = true;
         self.selected_preview_file = None;
+        self.preview_change_bounds = None;
 
         let (log_tx, log_rx) = channel();
+        let (control_tx, control_rx) = channel();
         self.log_receiver = Some(log_rx);
+        self.control_sender = Some(control_tx);
         self.is_running = true;
         self.status_text = "Kör offline-analys...".to_string();
 
@@ -713,6 +1001,14 @@ impl AscApp {
             // Sortera efter filnamn (tidsordning)
             entries.sort();
 
+            if stop_requested(&control_rx) {
+                let _ = log_tx.send(WorkerMessage::OfflineDone(
+                    "Efterhandsanalysen avbröts.".to_string(),
+                ));
+                ctx.request_repaint();
+                return;
+            }
+
             if entries.is_empty() {
                 let _ = log_tx.send(WorkerMessage::OfflineDone(
                     "Inga bildfiler hittades i mappen.".to_string(),
@@ -732,8 +1028,23 @@ impl AscApp {
                 )
             });
             for (idx, path) in entries.iter().enumerate() {
+                // Avbryt mellan filer. Resultaten som redan har skickats till UI:t behålls.
+                if stop_requested(&control_rx) {
+                    let _ = log_tx.send(WorkerMessage::OfflineDone(
+                        "Efterhandsanalysen avbröts.".to_string(),
+                    ));
+                    ctx.request_repaint();
+                    return;
+                }
                 match image::open(path) {
                     Ok(original_img) => {
+                        if stop_requested(&control_rx) {
+                            let _ = log_tx.send(WorkerMessage::OfflineDone(
+                                "Efterhandsanalysen avbröts.".to_string(),
+                            ));
+                            ctx.request_repaint();
+                            return;
+                        }
                         let source_img = original_img;
                         let img = if let Some(area) = crop_area {
                             capture::crop_image(&source_img, area)
@@ -750,6 +1061,7 @@ impl AscApp {
                         // Beräkna bildskillnad
                         let mut diff = 0.0;
                         let mut changed_pixels = 0;
+                        let mut change_bounds = None;
                         if let Some(ref p_img) = prev_img {
                             let difference = if measurement_regions.is_empty() {
                                 analysis::analyze_images(p_img, &img, small_change_color_delta)
@@ -763,6 +1075,15 @@ impl AscApp {
                             };
                             diff = difference.average;
                             changed_pixels = difference.changed_pixels;
+                            change_bounds = difference.bounds;
+                        }
+
+                        if stop_requested(&control_rx) {
+                            let _ = log_tx.send(WorkerMessage::OfflineDone(
+                                "Efterhandsanalysen avbröts.".to_string(),
+                            ));
+                            ctx.request_repaint();
+                            return;
                         }
 
                         // OCR (Textigenkänning)
@@ -782,6 +1103,13 @@ impl AscApp {
                             };
                             let mut texts = Vec::new();
                             for (region_index, ocr_img) in ocr_images.into_iter().enumerate() {
+                                if stop_requested(&control_rx) {
+                                    let _ = log_tx.send(WorkerMessage::OfflineDone(
+                                        "Efterhandsanalysen avbröts.".to_string(),
+                                    ));
+                                    ctx.request_repaint();
+                                    return;
+                                }
                                 let temp_path = std::env::temp_dir().join(format!(
                                     "asc_ocr_{}_{}_{}.png",
                                     std::process::id(),
@@ -794,6 +1122,13 @@ impl AscApp {
                                         Err(error) => texts.push(format!("OCR-fel: {error}")),
                                     }
                                     let _ = fs::remove_file(temp_path);
+                                }
+                                if stop_requested(&control_rx) {
+                                    let _ = log_tx.send(WorkerMessage::OfflineDone(
+                                        "Efterhandsanalysen avbröts.".to_string(),
+                                    ));
+                                    ctx.request_repaint();
+                                    return;
                                 }
                             }
                             ocr_text = texts.join("\n");
@@ -844,6 +1179,12 @@ impl AscApp {
                             timestamp,
                             pixel_diff: diff,
                             changed_pixels,
+                            change_summary: change_summary(
+                                changed_pixels,
+                                change_bounds,
+                                ocr_changed,
+                            ),
+                            change_bounds,
                             ocr_text,
                             is_changed,
                             file_name,
@@ -895,6 +1236,9 @@ impl AscApp {
         }
         if !available.contains(&self.mouse_typing_window_id) {
             self.mouse_typing_window_id = self.windows.first().map(|window| window.id).unwrap_or(0);
+        }
+        if !available.contains(&self.presence_window_id) {
+            self.presence_window_id = self.windows.first().map(|window| window.id).unwrap_or(0);
         }
     }
 
@@ -974,6 +1318,107 @@ impl AscApp {
         self.mouse_status = "Stoppar…".to_string();
     }
 
+    fn start_macro_recording(&mut self) {
+        if self.automation_running || self.mouse_running {
+            self.automation_status =
+                "Stoppa pågående mus- eller RPA-automatisering före inspelning.".to_string();
+            return;
+        }
+        match macro_recorder::MacroRecorder::start() {
+            Ok(recorder) => {
+                self.automation_recorder = Some(recorder);
+                self.automation_status = "INSPELNING PÅGÅR – använd andra program normalt. Stoppa med Ctrl+Alt+Esc eller knappen här.".to_string();
+                self.automation_last_activity =
+                    "Vanlig tangenttext och musrörelser spelas inte in.".to_string();
+            }
+            Err(error) => self.automation_status = error,
+        }
+    }
+
+    fn stop_macro_recording(&mut self) {
+        let Some(recorder) = self.automation_recorder.take() else {
+            return;
+        };
+        match recorder.stop() {
+            Ok(recording) => self.import_macro_recording(recording),
+            Err(error) => self.automation_status = error,
+        }
+    }
+
+    fn import_macro_recording(&mut self, recording: macro_recorder::MacroRecording) {
+        let mut steps = Vec::new();
+        let mut previous_at = 0_u64;
+        let mut active_window = None;
+        let mut first_window = None;
+        let mut skipped = 0_usize;
+
+        for event in recording.events {
+            let Ok(window_id) = u32::try_from(event.window.hwnd) else {
+                skipped += 1;
+                continue;
+            };
+            first_window.get_or_insert(window_id);
+            let delay_ms = event.after_ms.saturating_sub(previous_at).min(600_000);
+            previous_at = event.after_ms;
+            if delay_ms >= 50 {
+                steps.push(AutomationStepEditor::recorded_wait(delay_ms));
+            }
+            if active_window != Some(window_id) {
+                let mut switch = AutomationStepEditor::switch_window(window_id);
+                switch.value = event.window.title.clone();
+                steps.push(switch);
+                active_window = Some(window_id);
+            }
+            match event.action {
+                macro_recorder::RecordedAction::Click {
+                    button,
+                    normalized_x,
+                    normalized_y,
+                } => steps.push(AutomationStepEditor::recorded_click(
+                    normalized_x,
+                    normalized_y,
+                    button,
+                )),
+                macro_recorder::RecordedAction::Shortcut(shortcut) => {
+                    let value = match shortcut {
+                        macro_recorder::RecordedShortcut::Copy => "copy",
+                        macro_recorder::RecordedShortcut::Paste => "paste",
+                        macro_recorder::RecordedShortcut::SelectAll => "select_all",
+                        macro_recorder::RecordedShortcut::Enter => "enter",
+                        macro_recorder::RecordedShortcut::Escape => "escape",
+                    };
+                    steps.push(AutomationStepEditor::shortcut(value));
+                }
+            }
+        }
+
+        if steps.is_empty() {
+            self.automation_status =
+                "Inspelningen innehöll inga importerbara klick eller godkända kortkommandon."
+                    .to_string();
+            return;
+        }
+        let action_count = steps
+            .iter()
+            .filter(|step| matches!(step.kind.as_str(), "click_relative" | "shortcut"))
+            .count();
+        self.automation_steps = steps;
+        if let Some(window_id) = first_window {
+            self.automation_window_id = window_id;
+        }
+        self.automation_repeat = false;
+        self.automation_dry_run = true;
+        self.refresh_mouse_windows();
+        self.automation_status = format!(
+            "Importerade {action_count} åtgärder från inspelningen{}; kontrollera fönster och kör torrkörning.",
+            if skipped == 0 {
+                String::new()
+            } else {
+                format!(" ({skipped} hoppades över)")
+            }
+        );
+    }
+
     fn start_automation(&mut self, ctx: &egui::Context) {
         if self.mouse_running {
             self.automation_status = "Stoppa muspekarsimuleringen först.".to_string();
@@ -991,9 +1436,41 @@ impl AscApp {
         let mut steps = Vec::new();
         for (index, step) in self.automation_steps.iter().enumerate() {
             match step.kind.as_str() {
+                "switch_window" => {
+                    let Some(window) = self
+                        .windows
+                        .iter()
+                        .find(|window| window.id == step.target_window_id)
+                    else {
+                        self.automation_status =
+                            format!("Steg {} saknar ett tillgängligt målfönster.", index + 1);
+                        return;
+                    };
+                    if !step.value.trim().is_empty() && window.title != step.value {
+                        self.automation_status = format!(
+                            "Steg {} stoppades: fönstertiteln har ändrats från ‘{}’ till ‘{}’.",
+                            index + 1,
+                            step.value,
+                            window.title
+                        );
+                        return;
+                    }
+                    steps.push(mouse_sim::AutomationStep::SetTargetWindow(
+                        step.target_window_id,
+                    ));
+                }
                 "wait" => steps.push(mouse_sim::AutomationStep::Wait(Duration::from_secs(
                     step.seconds,
                 ))),
+                "wait_recorded" => steps.push(mouse_sim::AutomationStep::Wait(
+                    Duration::from_millis(step.delay_ms),
+                )),
+                "wait_ready" => steps.push(mouse_sim::AutomationStep::WaitForStable {
+                    minimum: Duration::from_secs(step.seconds),
+                    stable_for: Duration::from_secs(2),
+                    timeout: Duration::from_secs(step.timeout_seconds.max(2)),
+                    max_changed_fraction: 0.005,
+                }),
                 "type_text" => {
                     if step.value.is_empty() {
                         self.automation_status =
@@ -1002,16 +1479,51 @@ impl AscApp {
                     }
                     steps.push(mouse_sim::AutomationStep::TypeText(step.value.clone()));
                 }
+                "shortcut" => {
+                    let shortcut = match step.value.as_str() {
+                        "paste" => mouse_sim::Shortcut::Paste,
+                        "select_all" => mouse_sim::Shortcut::SelectAll,
+                        "enter" => mouse_sim::Shortcut::Enter,
+                        "escape" => mouse_sim::Shortcut::Escape,
+                        _ => mouse_sim::Shortcut::Copy,
+                    };
+                    steps.push(mouse_sim::AutomationStep::Shortcut(shortcut));
+                }
+                "confirm" => steps.push(mouse_sim::AutomationStep::PauseForConfirmation(
+                    if step.value.trim().is_empty() {
+                        "Kontrollera resultatet innan du fortsätter manuellt.".to_string()
+                    } else {
+                        step.value.trim().to_string()
+                    },
+                )),
                 "click_image" => {
-                    if !Path::new(&step.value).is_file() {
+                    let (Some(template), Some(expected_area), Some(reference_size)) = (
+                        step.template_image.clone(),
+                        step.expected_area,
+                        step.reference_size,
+                    ) else {
                         self.automation_status =
-                            format!("Steg {} saknar en giltig referensbild.", index + 1);
+                            format!("Steg {} saknar en markering från målfönstret.", index + 1);
                         return;
-                    }
+                    };
                     steps.push(mouse_sim::AutomationStep::ClickImage {
-                        image_path: step.value.clone(),
+                        template,
+                        expected_area,
+                        reference_size,
                         timeout: Duration::from_secs(step.seconds.max(1)),
                         confidence: step.confidence / 100.0,
+                        position_tolerance: 0.10,
+                    });
+                }
+                "click_relative" => {
+                    steps.push(mouse_sim::AutomationStep::ClickRelative {
+                        x_fraction: step.relative_x.clamp(0.0, 1.0),
+                        y_fraction: step.relative_y.clamp(0.0, 1.0),
+                        button: if step.click_button == "right" {
+                            mouse_sim::PointerButton::Right
+                        } else {
+                            mouse_sim::PointerButton::Left
+                        },
                     });
                 }
                 _ => {
@@ -1035,13 +1547,18 @@ impl AscApp {
             window_id: self.automation_window_id,
             steps,
             repeat: self.automation_repeat,
+            dry_run: self.automation_dry_run,
         };
         let (event_tx, event_rx) = channel();
         let (control_tx, control_rx) = channel();
         self.automation_receiver = Some(event_rx);
         self.automation_control_sender = Some(control_tx);
         self.automation_running = true;
-        self.automation_status = "OCR-klicksekvensen körs.".to_string();
+        self.automation_status = if self.automation_dry_run {
+            "Torrkörning av RPA-sekvensen pågår.".to_string()
+        } else {
+            "RPA-sekvensen körs.".to_string()
+        };
         self.automation_last_activity = "Startar första steget…".to_string();
         std::thread::spawn(move || mouse_sim::run_ocr_sequence(config, control_rx, event_tx));
         ctx.request_repaint();
@@ -1052,6 +1569,493 @@ impl AscApp {
             let _ = sender.send(());
         }
         self.automation_status = "Stoppar…".to_string();
+    }
+
+    fn start_presence_tracking(&mut self, ctx: &egui::Context) {
+        if self.presence_person.trim().is_empty() {
+            self.presence_status_text = "Ange namnet som ska följas.".to_string();
+            return;
+        }
+        if !self
+            .windows
+            .iter()
+            .any(|window| window.id == self.presence_window_id)
+        {
+            self.presence_status_text = "Välj ett tillgängligt Teams-fönster.".to_string();
+            return;
+        }
+        if self.presence_ocr_area.is_none() && self.presence_color_area.is_none() {
+            self.presence_status_text =
+                "Markera ett OCR-område eller området runt statusbollen först.".to_string();
+            return;
+        }
+        let config = presence::Config {
+            window_id: self.presence_window_id,
+            person: self.presence_person.trim().to_string(),
+            ocr_area: self.presence_ocr_area,
+            color_area: self.presence_color_area,
+            interval: Duration::from_secs(self.presence_interval_secs.max(1)),
+        };
+        let (event_tx, event_rx) = channel();
+        let (control_tx, control_rx) = channel();
+        self.presence_receiver = Some(event_rx);
+        self.presence_control_sender = Some(control_tx);
+        self.presence_running = true;
+        self.presence_status_text = "Övervakar Teams-status…".to_string();
+        std::thread::spawn(move || presence::run(config, control_rx, event_tx));
+        ctx.request_repaint();
+    }
+
+    fn stop_presence_tracking(&mut self) {
+        if let Some(sender) = self.presence_control_sender.as_ref() {
+            let _ = sender.send(());
+        }
+        self.presence_status_text = "Stoppar…".to_string();
+    }
+
+    fn show_presence_tab(&mut self, ctx: &egui::Context) {
+        if self.presence_region_setup_pending
+            && (!self.ocr_regions.is_empty() || !self.measurement_regions.is_empty())
+        {
+            self.presence_ocr_area = self.ocr_regions.first().copied();
+            self.presence_color_area = self.measurement_regions.first().copied();
+            self.presence_region_setup_pending = false;
+            self.presence_status_text = "De visuella Teams-områdena har hämtats.".to_string();
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Teams-status");
+            ui.label(
+                "Följ din egen eller en annan synlig persons status lokalt och summera tiden i varje läge.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Status:");
+                ui.colored_label(
+                    if self.presence_running {
+                        egui::Color32::GREEN
+                    } else {
+                        egui::Color32::LIGHT_GRAY
+                    },
+                    &self.presence_status_text,
+                );
+            });
+            if let Some(status) = self.presence_current_status {
+                ui.strong(format!("Aktuellt läge: {}", status.label()));
+            }
+            ui.separator();
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_enabled_ui(!self.presence_running, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Teams-fönster:");
+                        egui::ComboBox::from_id_source("presence_window")
+                            .width(420.0)
+                            .selected_text(
+                                self.windows
+                                    .iter()
+                                    .find(|window| window.id == self.presence_window_id)
+                                    .map(|window| {
+                                        format!("{} — {}", window.app_name, window.title)
+                                    })
+                                    .unwrap_or_else(|| "Välj fönster…".to_string()),
+                            )
+                            .show_ui(ui, |ui| {
+                                for window in &self.windows {
+                                    ui.selectable_value(
+                                        &mut self.presence_window_id,
+                                        window.id,
+                                        format!("{} — {}", window.app_name, window.title),
+                                    );
+                                }
+                            });
+                        if ui.button("Uppdatera").clicked() {
+                            self.refresh_mouse_windows();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Namn:");
+                        ui.text_edit_singleline(&mut self.presence_person);
+                        ui.label("Kontrollera var");
+                        ui.add(
+                            egui::DragValue::new(&mut self.presence_interval_secs)
+                                .range(1..=300)
+                                .suffix(":e sekund"),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Markera områden visuellt…").clicked() {
+                            self.mode = "live".to_string();
+                            self.source_type = "window".to_string();
+                            self.selected_source_id = self.presence_window_id;
+                            self.presence_region_setup_pending = true;
+                            self.active_tab = "analysis".to_string();
+                            self.start_region_editor(ctx);
+                            self.status_text = "Markera personraden som OCR och statusbollen som Pixel/färg. När resultatet är klart går du tillbaka till Teams-status; områdena hämtas automatiskt.".to_string();
+                        }
+                        if ui.button("Hämta markeringarna").clicked() {
+                            self.presence_ocr_area = self.ocr_regions.first().copied();
+                            self.presence_color_area = self.measurement_regions.first().copied();
+                            self.presence_status_text = format!(
+                                "Områden hämtade: OCR {}, statusboll {}.",
+                                if self.presence_ocr_area.is_some() { "ja" } else { "nej" },
+                                if self.presence_color_area.is_some() { "ja" } else { "nej" }
+                            );
+                        }
+                    });
+                    ui.small(
+                        "OCR-området bör innehålla namn och eventuell statustext. Pixel/färg-området ska ligga tätt runt statusbollen i Teams-listan.",
+                    );
+                    ui.label(format!(
+                        "OCR: {} · statusboll: {}",
+                        self.presence_ocr_area
+                            .map(|area| format!("{},{} {}×{}", area.0, area.1, area.2, area.3))
+                            .unwrap_or_else(|| "inte vald".to_string()),
+                        self.presence_color_area
+                            .map(|area| format!("{},{} {}×{}", area.0, area.1, area.2, area.3))
+                            .unwrap_or_else(|| "inte vald".to_string())
+                    ));
+                    ui.small(
+                        "Enbart statusbollen räcker för grön/tillgänglig, röd/upptagen, gul/frånvarande och grå/offline. OCR behövs för att säkert skilja Stör ej från andra röda lägen.",
+                    );
+                });
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if self.presence_running {
+                        if ui.button("Stoppa statusövervakning").clicked() {
+                            self.stop_presence_tracking();
+                        }
+                    } else if ui.button("Starta statusövervakning").clicked() {
+                        self.start_presence_tracking(ctx);
+                    }
+                    if ui
+                        .add_enabled(!self.presence_running, egui::Button::new("Rensa historik"))
+                        .clicked()
+                    {
+                        self.presence_periods.clear();
+                        self.presence_current_status = None;
+                        self.presence_current_started = None;
+                    }
+                });
+
+                ui.add_space(14.0);
+                ui.heading("Tid per status");
+                let current_elapsed = self
+                    .presence_current_started
+                    .map(|started| started.elapsed().as_secs())
+                    .unwrap_or(0);
+                let totals = presence::PresenceStatus::ALL
+                    .into_iter()
+                    .map(|status| {
+                        let mut seconds = self
+                            .presence_periods
+                            .iter()
+                            .filter(|period| period.status == status)
+                            .map(|period| period.duration_seconds)
+                            .sum::<u64>();
+                        if self.presence_current_status == Some(status) {
+                            seconds += current_elapsed;
+                        }
+                        (status, seconds)
+                    })
+                    .collect::<Vec<_>>();
+                let maximum = totals.iter().map(|(_, seconds)| *seconds).max().unwrap_or(1).max(1);
+                for (status, seconds) in totals {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([110.0, 20.0], egui::Label::new(status.label()));
+                        let width = (ui.available_width() - 100.0).max(20.0);
+                        let (bar, _) = ui.allocate_exact_size(
+                            egui::vec2(width * seconds as f32 / maximum as f32, 16.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(bar, 2.0, presence_color(status));
+                        ui.label(format_duration(seconds));
+                    });
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Statushistorik");
+                for period in self.presence_periods.iter().rev().take(500) {
+                    let duration = if period.ended_at.is_none()
+                        && self.presence_current_status == Some(period.status)
+                    {
+                        period.duration_seconds + current_elapsed
+                    } else {
+                        period.duration_seconds
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(&period.started_at);
+                        ui.colored_label(presence_color(period.status), period.status.label());
+                        ui.label(format_duration(duration));
+                    });
+                }
+                if !self.presence_last_ocr.is_empty() {
+                    ui.collapsing("Senaste OCR-text", |ui| {
+                        ui.label(&self.presence_last_ocr);
+                    });
+                }
+                ui.small(
+                    "Historiken exporteras till teams-status.csv och teams-status.json när en analysmapp har valts.",
+                );
+            });
+        });
+    }
+
+    fn automation_window_for_step(&self, step_index: usize) -> u32 {
+        self.automation_steps
+            .iter()
+            .take(step_index + 1)
+            .rev()
+            .find(|step| step.kind == "switch_window" && step.target_window_id != 0)
+            .map(|step| step.target_window_id)
+            .unwrap_or(self.automation_window_id)
+    }
+
+    fn load_outlook_chatgpt_template(&mut self) {
+        let outlook_window = self.automation_window_id;
+        let mut reply = AutomationStepEditor::click_word();
+        reply.value = "Svara".to_string();
+
+        self.automation_steps = vec![
+            AutomationStepEditor::switch_window(outlook_window),
+            AutomationStepEditor::image_target("Markera det senaste mejlet"),
+            AutomationStepEditor::wait_ready(2),
+            AutomationStepEditor::image_target("Markera mejlets brödtext"),
+            AutomationStepEditor::shortcut("select_all"),
+            AutomationStepEditor::shortcut("copy"),
+            AutomationStepEditor::switch_window(0),
+            AutomationStepEditor::image_target("Markera ChatGPTs skrivfält"),
+            AutomationStepEditor::basic(
+                "type_text",
+                "Skriv ett professionellt och kort svar på följande mejl. Skapa bara svarstexten:\n\n",
+            ),
+            AutomationStepEditor::shortcut("paste"),
+            AutomationStepEditor::shortcut("enter"),
+            AutomationStepEditor::wait_ready(5),
+            AutomationStepEditor::image_target("Markera ChatGPTs knapp Kopiera svar"),
+            AutomationStepEditor::switch_window(outlook_window),
+            reply,
+            AutomationStepEditor::wait_ready(2),
+            AutomationStepEditor::image_target("Markera Outlooks svarsfält"),
+            AutomationStepEditor::shortcut("paste"),
+            AutomationStepEditor::basic(
+                "confirm",
+                "Granska mottagare, ämne och svar. Skicka sedan mejlet manuellt i Outlook.",
+            ),
+        ];
+        self.automation_repeat = false;
+        self.automation_dry_run = true;
+        self.automation_status = "Mallen är inlagd. Välj ChatGPT-fönster i steg 7 och markera alla bildmål innan torrkörning.".to_string();
+    }
+
+    fn load_ten_click_template(&mut self) {
+        let mut steps = Vec::with_capacity(19);
+        for click_number in 1..=10 {
+            steps.push(AutomationStepEditor::image_target(&format!(
+                "Markera klickmål {click_number}"
+            )));
+            if click_number < 10 {
+                let mut wait = AutomationStepEditor::wait();
+                wait.seconds = 2;
+                steps.push(wait);
+            }
+        }
+        self.automation_steps = steps;
+        self.automation_repeat = false;
+        self.automation_dry_run = true;
+        self.automation_status =
+            "10-klicksmall inlagd. Markera varje mål och justera väntetiderna.".to_string();
+    }
+
+    fn start_automation_picker(&mut self, step_index: usize, ctx: &egui::Context) {
+        let window_id = self.automation_window_for_step(step_index);
+        match capture::capture_source("window", window_id, None) {
+            Ok(image) => {
+                let rgba = image.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                self.automation_picker_texture = Some(ctx.load_texture(
+                    "automation_target_picker",
+                    egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+                    egui::TextureOptions::default(),
+                ));
+                self.automation_picker_image = Some(image);
+                self.automation_picker_size = Some(size);
+                self.automation_picker_step = Some(step_index);
+                self.automation_picker_drag_start = None;
+                self.automation_picker_selection = None;
+                self.automation_status =
+                    "Dra en ram runt knappen eller bilden som ska klickas.".to_string();
+            }
+            Err(error) => {
+                self.automation_status = format!("Kunde inte ta klipp av målfönstret: {error}");
+            }
+        }
+    }
+
+    fn close_automation_picker(&mut self) {
+        self.automation_picker_step = None;
+        self.automation_picker_image = None;
+        self.automation_picker_texture = None;
+        self.automation_picker_size = None;
+        self.automation_picker_drag_start = None;
+        self.automation_picker_selection = None;
+    }
+
+    fn show_automation_image_picker(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Markera bildmål i målfönstret");
+            ui.label(
+                "Dra tätt runt den textlösa knappen eller grafiken. Den ursprungliga platsen används som ankare med ±10 % sökmarginal.",
+            );
+            let mut cancel = false;
+            let mut apply = false;
+            ui.horizontal(|ui| {
+                if ui.button("Avbryt").clicked() {
+                    cancel = true;
+                }
+                if ui
+                    .add_enabled(
+                        self.automation_picker_selection.is_some(),
+                        egui::Button::new("Använd markering"),
+                    )
+                    .clicked()
+                {
+                    apply = true;
+                }
+            });
+            ui.separator();
+
+            if cancel {
+                self.close_automation_picker();
+                self.automation_status = "Bildmarkeringen avbröts.".to_string();
+                return;
+            }
+            if apply {
+                if let (Some(step_index), Some(image), Some(area), Some(size)) = (
+                    self.automation_picker_step,
+                    self.automation_picker_image.as_ref(),
+                    self.automation_picker_selection,
+                    self.automation_picker_size,
+                ) {
+                    let template = capture::crop_image(image, area);
+                    if let Some(step) = self.automation_steps.get_mut(step_index) {
+                        step.template_image = Some(template);
+                        step.expected_area = Some(area);
+                        step.reference_size = Some((size[0] as u32, size[1] as u32));
+                        step.value = format!(
+                            "Markerat: x {}, y {}, {}×{} px",
+                            area.0, area.1, area.2, area.3
+                        );
+                    }
+                    self.close_automation_picker();
+                    self.automation_status =
+                        "Bildmålet sparades med ±10 % positionsmarginal.".to_string();
+                }
+                return;
+            }
+
+            let (Some(texture), Some(size)) = (
+                self.automation_picker_texture.as_ref(),
+                self.automation_picker_size,
+            ) else {
+                ui.label("Ingen fönsterbild tillgänglig.");
+                return;
+            };
+            let canvas_size = egui::vec2(
+                ui.available_width().max(1.0),
+                ui.available_height().max(1.0),
+            );
+            let (canvas, response) =
+                ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
+            let painter = ui.painter_at(canvas);
+            painter.rect_filled(canvas, 4.0, egui::Color32::from_black_alpha(40));
+            let image_size = egui::vec2(size[0] as f32, size[1] as f32);
+            let fit_scale = (canvas.width() / image_size.x)
+                .min(canvas.height() / image_size.y)
+                .max(f32::EPSILON);
+            let image_rect = egui::Rect::from_center_size(canvas.center(), image_size * fit_scale);
+            painter.image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            let pointer_to_image = |position: egui::Pos2| {
+                egui::pos2(
+                    ((position.x - image_rect.left()) / image_rect.width() * size[0] as f32)
+                        .clamp(0.0, size[0] as f32),
+                    ((position.y - image_rect.top()) / image_rect.height() * size[1] as f32)
+                        .clamp(0.0, size[1] as f32),
+                )
+            };
+            let region_to_screen = |area: (u32, u32, u32, u32)| {
+                egui::Rect::from_min_max(
+                    egui::pos2(
+                        image_rect.left() + area.0 as f32 / size[0] as f32 * image_rect.width(),
+                        image_rect.top() + area.1 as f32 / size[1] as f32 * image_rect.height(),
+                    ),
+                    egui::pos2(
+                        image_rect.left()
+                            + (area.0 + area.2) as f32 / size[0] as f32 * image_rect.width(),
+                        image_rect.top()
+                            + (area.1 + area.3) as f32 / size[1] as f32 * image_rect.height(),
+                    ),
+                )
+            };
+
+            if let Some(area) = self.automation_picker_selection {
+                painter.rect_stroke(
+                    region_to_screen(area),
+                    0.0,
+                    egui::Stroke::new(2.0, egui::Color32::YELLOW),
+                );
+            }
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(position) = response.interact_pointer_pos() {
+                    if image_rect.contains(position) {
+                        self.automation_picker_drag_start = Some(pointer_to_image(position));
+                    }
+                }
+            }
+            if let (Some(start), Some(position)) = (
+                self.automation_picker_drag_start,
+                response.interact_pointer_pos(),
+            ) {
+                let selection = egui::Rect::from_two_pos(start, pointer_to_image(position));
+                let preview = (
+                    selection.min.x.floor() as u32,
+                    selection.min.y.floor() as u32,
+                    selection.width().ceil() as u32,
+                    selection.height().ceil() as u32,
+                );
+                painter.rect_stroke(
+                    region_to_screen(preview),
+                    0.0,
+                    egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE),
+                );
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if let (Some(start), Some(position)) = (
+                    self.automation_picker_drag_start.take(),
+                    response.interact_pointer_pos(),
+                ) {
+                    let selection = egui::Rect::from_two_pos(start, pointer_to_image(position));
+                    let area = (
+                        selection.min.x.floor() as u32,
+                        selection.min.y.floor() as u32,
+                        selection.width().ceil() as u32,
+                        selection.height().ceil() as u32,
+                    );
+                    if area.2 >= 8 && area.3 >= 8 {
+                        self.automation_picker_selection = Some(area);
+                    }
+                }
+            }
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        });
     }
 
     fn show_mouse_tab(&mut self, ctx: &egui::Context) {
@@ -1129,7 +2133,7 @@ impl AscApp {
                         "Klicka i särskilt valda fönster",
                     );
                     ui.small(
-                        "Klick är avstängt som standard. ASC klickar aldrig i ett omarkerat fönster.",
+                        "Klick är avstängt som standard. Anteckningar - ASC klickar aldrig i ett omarkerat fönster.",
                     );
                     if self.mouse_click_enabled {
                         ui.horizontal_wrapped(|ui| {
@@ -1243,7 +2247,7 @@ impl AscApp {
                                     });
                             });
                             ui.small(
-                                "Vid skrivning klickar ASC endast i det valda skrivfönstrets innehållsyta.",
+                                "Vid skrivning klickar Anteckningar - ASC endast i det valda skrivfönstrets innehållsyta.",
                             );
                         }
                     }
@@ -1295,6 +2299,11 @@ impl AscApp {
     }
 
     fn show_automation_tab(&mut self, ctx: &egui::Context) {
+        if self.automation_picker_step.is_some() {
+            self.show_automation_image_picker(ctx);
+            return;
+        }
+        let macro_recording = self.automation_recorder.is_some();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("RPA-klicksekvens");
             ui.label(
@@ -1303,7 +2312,9 @@ impl AscApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Status:");
                 ui.colored_label(
-                    if self.automation_running {
+                    if macro_recording {
+                        egui::Color32::RED
+                    } else if self.automation_running {
                         egui::Color32::GREEN
                     } else {
                         egui::Color32::LIGHT_GRAY
@@ -1312,10 +2323,30 @@ impl AscApp {
                 );
             });
             ui.small(format!("Senast: {}", self.automation_last_activity));
+            ui.horizontal_wrapped(|ui| {
+                if macro_recording {
+                    if ui
+                        .add(
+                            egui::Button::new("Stoppa och importera inspelning")
+                                .fill(egui::Color32::from_rgb(190, 45, 45)),
+                        )
+                        .clicked()
+                    {
+                        self.stop_macro_recording();
+                    }
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "Global inspelning pågår – Ctrl+Alt+Esc stoppar från valfritt fönster.",
+                    );
+                } else if ui.button("Spela in klick och kortkommandon").clicked() {
+                    self.start_macro_recording();
+                }
+            });
+            ui.small("Windows-inspelaren sparar vänster-/högerklick, Ctrl+C/V/A, Enter och Escape. Vanlig text, lösenord, urklippsinnehåll och musrörelser sparas aldrig.");
             ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_enabled_ui(!self.automation_running, |ui| {
+                ui.add_enabled_ui(!self.automation_running && !macro_recording, |ui| {
                     ui.heading("Målfönster");
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_source("automation_window_combo")
@@ -1348,11 +2379,21 @@ impl AscApp {
 
                     ui.add_space(14.0);
                     ui.heading("Flödessteg");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Mall: Outlook → ChatGPT → utkast").clicked() {
+                            self.load_outlook_chatgpt_template();
+                        }
+                        if ui.button("Mall: exakt 10 klick").clicked() {
+                            self.load_ten_click_template();
+                        }
+                    });
+                    ui.small(
+                        "Mallar ersätter den aktuella steglistan och startar alltid i torrkörningsläge.",
+                    );
                     let mut remove = None;
                     let mut move_up = None;
                     let mut move_down = None;
                     let mut pick_image = None;
-                    let image_picker_running = self.automation_image_picker_receiver.is_some();
                     let step_count = self.automation_steps.len();
                     for (index, step) in self.automation_steps.iter_mut().enumerate() {
                         ui.group(|ui| {
@@ -1360,12 +2401,23 @@ impl AscApp {
                                 ui.strong(format!("{}", index + 1));
                                 egui::ComboBox::from_id_source(("automation_step", index))
                                     .selected_text(match step.kind.as_str() {
+                                        "switch_window" => "Byt målfönster",
                                         "wait" => "Vänta",
+                                        "wait_recorded" => "Inspelad väntan",
+                                        "wait_ready" => "Vänta tills sidan är klar",
                                         "type_text" => "Skriv text",
+                                        "shortcut" => "Kortkommando",
+                                        "confirm" => "Manuell bekräftelse",
+                                        "click_relative" => "Inspelat positionsklick",
                                         "click_image" => "Klicka på bild",
                                         _ => "Klicka på OCR-ord",
                                     })
                                     .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut step.kind,
+                                            "switch_window".to_string(),
+                                            "Byt målfönster",
+                                        );
                                         ui.selectable_value(
                                             &mut step.kind,
                                             "click_word".to_string(),
@@ -1378,16 +2430,91 @@ impl AscApp {
                                         );
                                         ui.selectable_value(
                                             &mut step.kind,
+                                            "click_relative".to_string(),
+                                            "Inspelat positionsklick",
+                                        );
+                                        ui.selectable_value(
+                                            &mut step.kind,
                                             "wait".to_string(),
                                             "Vänta",
+                                        );
+                                        ui.selectable_value(
+                                            &mut step.kind,
+                                            "wait_ready".to_string(),
+                                            "Vänta tills sidan är klar",
                                         );
                                         ui.selectable_value(
                                             &mut step.kind,
                                             "type_text".to_string(),
                                             "Skriv text",
                                         );
+                                        ui.selectable_value(
+                                            &mut step.kind,
+                                            "shortcut".to_string(),
+                                            "Kortkommando",
+                                        );
+                                        ui.selectable_value(
+                                            &mut step.kind,
+                                            "confirm".to_string(),
+                                            "Manuell bekräftelse",
+                                        );
                                     });
                                 match step.kind.as_str() {
+                                    "switch_window" => {
+                                        egui::ComboBox::from_id_source((
+                                            "automation_step_window",
+                                            index,
+                                        ))
+                                        .width(360.0)
+                                        .selected_text(
+                                            self.windows
+                                                .iter()
+                                                .find(|window| {
+                                                    window.id == step.target_window_id
+                                                })
+                                                .map(|window| {
+                                                    format!(
+                                                        "{} — {}",
+                                                        window.app_name, window.title
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    "Välj nästa målfönster…".to_string()
+                                                }),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for window in &self.windows {
+                                                ui.selectable_value(
+                                                    &mut step.target_window_id,
+                                                    window.id,
+                                                    format!(
+                                                        "{} — {}",
+                                                        window.app_name, window.title
+                                                    ),
+                                                );
+                                            }
+                                        });
+                                        if !step.value.is_empty() {
+                                            let current_title = self
+                                                .windows
+                                                .iter()
+                                                .find(|window| {
+                                                    window.id == step.target_window_id
+                                                })
+                                                .map(|window| window.title.clone());
+                                            ui.small(format!(
+                                                "Inspelad titel: {}",
+                                                step.value
+                                            ));
+                                            if current_title.as_deref() != Some(step.value.as_str())
+                                                && ui.button("Godkänn aktuell titel").clicked()
+                                            {
+                                                if let Some(title) = current_title {
+                                                    step.value = title;
+                                                }
+                                            }
+                                        }
+                                    }
                                     "wait" => {
                                         ui.add(
                                             egui::DragValue::new(&mut step.seconds)
@@ -1395,20 +2522,85 @@ impl AscApp {
                                                 .suffix(" sekunder"),
                                         );
                                     }
+                                    "wait_recorded" => {
+                                        ui.add(
+                                            egui::DragValue::new(&mut step.delay_ms)
+                                                .range(0..=600_000)
+                                                .suffix(" ms"),
+                                        );
+                                    }
+                                    "wait_ready" => {
+                                        ui.label("Minst:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut step.seconds)
+                                                .range(1..=3_600)
+                                                .suffix(" sek"),
+                                        );
+                                        ui.label("Timeout efter minimitid:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut step.timeout_seconds)
+                                                .range(2..=3_600)
+                                                .suffix(" sek"),
+                                        );
+                                    }
                                     "type_text" => {
                                         ui.label("Text:");
                                         ui.text_edit_singleline(&mut step.value);
                                     }
-                                    "click_image" => {
-                                        ui.label("Bild:");
+                                    "shortcut" => {
+                                        if step.value.is_empty() {
+                                            step.value = "copy".to_string();
+                                        }
+                                        egui::ComboBox::from_id_source((
+                                            "automation_shortcut",
+                                            index,
+                                        ))
+                                        .selected_text(match step.value.as_str() {
+                                            "paste" => "Klistra in",
+                                            "select_all" => "Markera allt",
+                                            "enter" => "Enter",
+                                            "escape" => "Escape",
+                                            _ => "Kopiera",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut step.value,
+                                                "copy".to_string(),
+                                                "Kopiera",
+                                            );
+                                            ui.selectable_value(
+                                                &mut step.value,
+                                                "paste".to_string(),
+                                                "Klistra in",
+                                            );
+                                            ui.selectable_value(
+                                                &mut step.value,
+                                                "select_all".to_string(),
+                                                "Markera allt",
+                                            );
+                                            ui.selectable_value(
+                                                &mut step.value,
+                                                "enter".to_string(),
+                                                "Enter",
+                                            );
+                                            ui.selectable_value(
+                                                &mut step.value,
+                                                "escape".to_string(),
+                                                "Escape",
+                                            );
+                                        });
+                                    }
+                                    "confirm" => {
+                                        ui.label("Instruktion:");
                                         ui.text_edit_singleline(&mut step.value);
-                                        if ui
-                                            .add_enabled(
-                                                !image_picker_running,
-                                                egui::Button::new("Välj…"),
-                                            )
-                                            .clicked()
-                                        {
+                                    }
+                                    "click_image" => {
+                                        ui.label(if step.template_image.is_some() {
+                                            &step.value
+                                        } else {
+                                            "Ingen markering"
+                                        });
+                                        if ui.button("Markera i målfönster…").clicked() {
                                             pick_image = Some(index);
                                         }
                                         ui.label("Likhet:");
@@ -1423,6 +2615,47 @@ impl AscApp {
                                                 .range(1..=600)
                                                 .suffix(" sek"),
                                         );
+                                    }
+                                    "click_relative" => {
+                                        ui.label("X:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut step.relative_x)
+                                                .range(0.0..=1.0)
+                                                .speed(0.005)
+                                                .custom_formatter(|value, _| {
+                                                    format!("{:.1} %", value * 100.0)
+                                                }),
+                                        );
+                                        ui.label("Y:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut step.relative_y)
+                                                .range(0.0..=1.0)
+                                                .speed(0.005)
+                                                .custom_formatter(|value, _| {
+                                                    format!("{:.1} %", value * 100.0)
+                                                }),
+                                        );
+                                        egui::ComboBox::from_id_source((
+                                            "automation_click_button",
+                                            index,
+                                        ))
+                                        .selected_text(if step.click_button == "right" {
+                                            "Högerklick"
+                                        } else {
+                                            "Vänsterklick"
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut step.click_button,
+                                                "left".to_string(),
+                                                "Vänsterklick",
+                                            );
+                                            ui.selectable_value(
+                                                &mut step.click_button,
+                                                "right".to_string(),
+                                                "Högerklick",
+                                            );
+                                        });
                                     }
                                     _ => {
                                         ui.label("Ord:");
@@ -1455,18 +2688,7 @@ impl AscApp {
                         self.automation_steps.remove(index);
                     }
                     if let Some(index) = pick_image {
-                        let (picker_tx, picker_rx) = channel();
-                        self.automation_image_picker_receiver = Some(picker_rx);
-                        let repaint_ctx = ctx.clone();
-                        std::thread::spawn(move || {
-                            let result = rfd::FileDialog::new()
-                                .set_title("Välj referensbild")
-                                .add_filter("Bild", &["png", "jpg", "jpeg"])
-                                .pick_file()
-                                .map(|path| (index, path.to_string_lossy().to_string()));
-                            let _ = picker_tx.send(result);
-                            repaint_ctx.request_repaint();
-                        });
+                        self.start_automation_picker(index, ctx);
                     }
                     ui.horizontal(|ui| {
                         if ui.button("+ OCR-klick").clicked() {
@@ -1475,25 +2697,118 @@ impl AscApp {
                         if ui.button("+ Vänta").clicked() {
                             self.automation_steps.push(AutomationStepEditor::wait());
                         }
+                        if ui.button("+ Vänta tills klar").clicked() {
+                            self.automation_steps.push(AutomationStepEditor {
+                                kind: "wait_ready".to_string(),
+                                value: String::new(),
+                                target_window_id: 0,
+                                seconds: 5,
+                                timeout_seconds: 60,
+                                confidence: 90.0,
+                                template_image: None,
+                                expected_area: None,
+                                reference_size: None,
+                                relative_x: 0.5,
+                                relative_y: 0.5,
+                                click_button: "left".to_string(),
+                                delay_ms: 0,
+                            });
+                        }
                         if ui.button("+ Bildklick").clicked() {
                             self.automation_steps.push(AutomationStepEditor {
                                 kind: "click_image".to_string(),
                                 value: String::new(),
+                                target_window_id: 0,
                                 seconds: 30,
-                                confidence: 90.0,
+                                timeout_seconds: 60,
+                                confidence: 85.0,
+                                template_image: None,
+                                expected_area: None,
+                                reference_size: None,
+                                relative_x: 0.5,
+                                relative_y: 0.5,
+                                click_button: "left".to_string(),
+                                delay_ms: 0,
                             });
                         }
                         if ui.button("+ Skriv text").clicked() {
                             self.automation_steps.push(AutomationStepEditor {
-                            kind: "type_text".to_string(),
-                            value: String::new(),
-                            seconds: 0,
-                            confidence: 90.0,
+                                kind: "type_text".to_string(),
+                                value: String::new(),
+                                target_window_id: 0,
+                                seconds: 0,
+                                timeout_seconds: 60,
+                                confidence: 90.0,
+                                template_image: None,
+                                expected_area: None,
+                                reference_size: None,
+                                relative_x: 0.5,
+                                relative_y: 0.5,
+                                click_button: "left".to_string(),
+                                delay_ms: 0,
                             });
                         }
                     });
-                    ui.small("Referensbilden bör vara ett tätt beskuret PNG-klipp av knappen eller ikonen i samma skala som i målfönstret.");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("+ Byt fönster").clicked() {
+                            self.automation_steps.push(AutomationStepEditor {
+                                kind: "switch_window".to_string(),
+                                value: String::new(),
+                                target_window_id: 0,
+                                seconds: 0,
+                                timeout_seconds: 60,
+                                confidence: 90.0,
+                                template_image: None,
+                                expected_area: None,
+                                reference_size: None,
+                                relative_x: 0.5,
+                                relative_y: 0.5,
+                                click_button: "left".to_string(),
+                                delay_ms: 0,
+                            });
+                        }
+                        if ui.button("+ Kortkommando").clicked() {
+                            self.automation_steps.push(AutomationStepEditor {
+                                kind: "shortcut".to_string(),
+                                value: "copy".to_string(),
+                                target_window_id: 0,
+                                seconds: 0,
+                                timeout_seconds: 60,
+                                confidence: 90.0,
+                                template_image: None,
+                                expected_area: None,
+                                reference_size: None,
+                                relative_x: 0.5,
+                                relative_y: 0.5,
+                                click_button: "left".to_string(),
+                                delay_ms: 0,
+                            });
+                        }
+                        if ui.button("+ Manuell bekräftelse").clicked() {
+                            self.automation_steps.push(AutomationStepEditor {
+                                kind: "confirm".to_string(),
+                                value: "Kontrollera svaret och skicka det manuellt i Outlook."
+                                    .to_string(),
+                                target_window_id: 0,
+                                seconds: 0,
+                                timeout_seconds: 60,
+                                confidence: 90.0,
+                                template_image: None,
+                                expected_area: None,
+                                reference_size: None,
+                                relative_x: 0.5,
+                                relative_y: 0.5,
+                                click_button: "left".to_string(),
+                                delay_ms: 0,
+                            });
+                        }
+                    });
+                    ui.small("Bildklick använder din markering som mall och söker bara nära ursprungsplatsen (±10 % av fönstret). Vänta tills klar kräver att högst 0,5 % av pixlarna ändras under två sekunder.");
                     ui.checkbox(&mut self.automation_repeat, "Upprepa hela flödet");
+                    ui.checkbox(
+                        &mut self.automation_dry_run,
+                        "Torrkörning – sök och verifiera, men klicka eller skriv inte",
+                    );
                     ui.colored_label(
                         egui::Color32::YELLOW,
                         "Kontrollera flödet utan Upprepa först. Klick och text kan ändra innehåll eller starta nedladdningar.",
@@ -1545,6 +2860,7 @@ impl AscApp {
         self.preview_pan = egui::Vec2::ZERO;
         self.follow_latest_preview = false;
         self.selected_preview_file = Some(title);
+        self.preview_change_bounds = None;
     }
 
     fn preview_crop(&mut self, ctx: &egui::Context) {
@@ -1647,9 +2963,12 @@ impl AscApp {
                 self.region_source_type = source_type;
                 self.region_source_id = source_id;
                 self.region_source_size = Some(image_size);
+                self.region_source_image = Some(image.clone());
                 self.display_preview_image(image, "Områdesväljare".to_string(), ctx);
                 self.region_editor_active = true;
+                self.region_result_preview = false;
                 self.region_drag_start = None;
+                self.region_interaction = None;
                 self.status_text = if cleared_stale_regions {
                     "Källan eller storleken ändrades. Gamla områden rensades; markera nya områden."
                         .to_string()
@@ -1662,9 +2981,11 @@ impl AscApp {
     }
 
     fn show_logged_capture(&mut self, log_index: usize, ctx: &egui::Context) {
-        let Some(file_name) = self.logs.get(log_index).map(|log| log.file_name.clone()) else {
+        let Some(log) = self.logs.get(log_index) else {
             return;
         };
+        let file_name = log.file_name.clone();
+        let change_bounds = log.change_bounds;
         if file_name.is_empty() {
             self.status_text =
                 "Klippet sparades inte. Välj en målmapp för att kunna öppna äldre klipp."
@@ -1684,6 +3005,7 @@ impl AscApp {
                     original_image
                 };
                 self.display_preview_image(image, file_name, ctx);
+                self.preview_change_bounds = change_bounds;
             }
             Err(error) => {
                 self.status_text = format!("Kunde inte öppna {}: {error}", path.display());
@@ -1712,25 +3034,35 @@ impl AscApp {
         let diff_width = 72.0;
         let pixels_width = 68.0;
         let status_width = 88.0;
+        let summary_width = 178.0;
         let ocr_width = (ui.available_width()
             - timestamp_width
             - diff_width
             - pixels_width
             - status_width
-            - spacing * 4.0)
+            - summary_width
+            - spacing * 5.0)
             .max(60.0);
         let widths = [
             timestamp_width,
             diff_width,
             pixels_width,
             ocr_width,
+            summary_width,
             status_width,
         ];
 
         ui.horizontal(|ui| {
-            for (label, width) in ["Tid", "Diff %", "Ändr. px", "OCR-text", "Status"]
-                .into_iter()
-                .zip(widths)
+            for (label, width) in [
+                "Tid",
+                "Diff %",
+                "Ändr. px",
+                "Vad ändrades?",
+                "OCR-text",
+                "Status",
+            ]
+            .into_iter()
+            .zip(widths)
             {
                 ui.add_sized([width, 18.0], egui::Label::new(label).truncate());
             }
@@ -1770,6 +3102,11 @@ impl AscApp {
                         );
                         ui.add_sized(
                             [widths[3], row_height],
+                            egui::Label::new(&log.change_summary).truncate(),
+                        )
+                        .on_hover_text(&log.change_summary);
+                        ui.add_sized(
+                            [widths[4], row_height],
                             egui::Label::new(&log.ocr_text).truncate(),
                         )
                         .on_hover_text(&log.ocr_text);
@@ -1778,7 +3115,7 @@ impl AscApp {
                         } else {
                             egui::RichText::new("Ingen ändring")
                         };
-                        ui.add_sized([widths[4], row_height], egui::Label::new(status).truncate());
+                        ui.add_sized([widths[5], row_height], egui::Label::new(status).truncate());
                     });
                 }
             },
@@ -1789,6 +3126,9 @@ impl AscApp {
     }
 
     fn show_preview_panel(&mut self, ui: &mut egui::Ui) {
+        let mut show_result = false;
+        let mut return_to_editor = false;
+        let mut accept_result = false;
         ui.horizontal_wrapped(|ui| {
             let title = self
                 .selected_preview_file
@@ -1802,6 +3142,7 @@ impl AscApp {
             {
                 self.follow_latest_preview = true;
                 self.selected_preview_file = None;
+                self.preview_change_bounds = None;
                 if let Some(texture) = self.latest_preview_texture.as_ref() {
                     self.preview_texture = Some(texture.clone());
                     self.preview_size = self.latest_preview_size;
@@ -1829,6 +3170,18 @@ impl AscApp {
                 ui.label("Rulla för zoom · dra för panorering · dubbelklicka för Anpassa");
             }
         });
+        if self.region_result_preview {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Färdigt resultat");
+                if ui.button("← Tillbaka och ändra").clicked() {
+                    return_to_editor = true;
+                }
+                if ui.button("Använd resultatet").clicked() {
+                    accept_result = true;
+                }
+            });
+            ui.small("Bilden nedan är exakt den skärmklippsyta som används under övervakningen.");
+        }
         if self.region_editor_active {
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Markera:");
@@ -1857,24 +3210,36 @@ impl AscApp {
                             self.measurement_regions.pop();
                         }
                     }
+                    self.region_selected = None;
+                    self.region_interaction = None;
                 }
                 if ui.button("Rensa alla områden").clicked() {
                     self.enable_crop = false;
                     self.ocr_regions.clear();
                     self.measurement_regions.clear();
+                    self.region_selected = None;
+                    self.region_interaction = None;
                 }
-                if ui.button("Klar").clicked() {
-                    self.region_editor_active = false;
-                    self.region_drag_start = None;
-                    self.status_text = format!(
-                        "Områden sparade: {} OCR, {} pixel/färg.",
-                        self.ocr_regions.len(),
-                        self.measurement_regions.len()
-                    );
+                if ui.button("OK – visa färdigt resultat").clicked() {
+                    show_result = true;
                 }
             });
             ui.small(
-                "Dra med vänster musknapp för att skapa området. Zooma med hjulet; använd Anpassa för helbild.",
+                "Dra på tom yta för att skapa. Dra inuti en vald ram för att flytta; dra ett hörnhandtag för att ändra storlek.",
+            );
+        }
+        if show_result {
+            let ctx = ui.ctx().clone();
+            self.show_region_result(&ctx);
+        } else if return_to_editor {
+            let ctx = ui.ctx().clone();
+            self.return_to_region_editor(&ctx);
+        } else if accept_result {
+            self.region_result_preview = false;
+            self.status_text = format!(
+                "Områden används: {} OCR, {} pixel/färg.",
+                self.ocr_regions.len(),
+                self.measurement_regions.len()
             );
         }
         ui.separator();
@@ -1932,6 +3297,41 @@ impl AscApp {
             egui::Color32::WHITE,
         );
 
+        if !self.region_editor_active {
+            if let Some(bounds) = self.preview_change_bounds {
+                if bounds.width > 0 && bounds.height > 0 {
+                    let left =
+                        image_rect.left() + bounds.x as f32 / size[0] as f32 * image_rect.width();
+                    let top =
+                        image_rect.top() + bounds.y as f32 / size[1] as f32 * image_rect.height();
+                    let right = image_rect.left()
+                        + (bounds.x + bounds.width) as f32 / size[0] as f32 * image_rect.width();
+                    let bottom = image_rect.top()
+                        + (bounds.y + bounds.height) as f32 / size[1] as f32 * image_rect.height();
+                    let changed_rect =
+                        egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
+                            .intersect(image_rect);
+                    painter.rect_filled(
+                        changed_rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(230, 45, 45, 42),
+                    );
+                    painter.rect_stroke(
+                        changed_rect,
+                        0.0,
+                        egui::Stroke::new(2.0, egui::Color32::RED),
+                    );
+                    painter.text(
+                        changed_rect.left_top() + egui::vec2(3.0, 3.0),
+                        egui::Align2::LEFT_TOP,
+                        "Ändrat område",
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::RED,
+                    );
+                }
+            }
+        }
+
         if self.region_editor_active {
             let pointer_to_image = |position: egui::Pos2| {
                 egui::pos2(
@@ -1951,9 +3351,148 @@ impl AscApp {
                     + (region.1 + region.3) as f32 / size[1] as f32 * image_rect.height();
                 egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
             };
-            let draw_region = |region, color: egui::Color32, label: &str| {
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(position) = response.interact_pointer_pos() {
+                    if image_rect.contains(position) {
+                        let image_position = pointer_to_image(position);
+                        let mut regions = Vec::new();
+                        if self.enable_crop {
+                            regions.push((
+                                RegionKind::Screenshot,
+                                0,
+                                (self.crop_x, self.crop_y, self.crop_w, self.crop_h),
+                            ));
+                        }
+                        regions.extend(
+                            self.ocr_regions
+                                .iter()
+                                .copied()
+                                .enumerate()
+                                .map(|(index, area)| (RegionKind::Ocr, index, area)),
+                        );
+                        regions.extend(
+                            self.measurement_regions
+                                .iter()
+                                .copied()
+                                .enumerate()
+                                .map(|(index, area)| (RegionKind::Measurement, index, area)),
+                        );
+                        let mut hit = None;
+                        for (kind, index, area) in regions.into_iter().rev() {
+                            let screen = region_to_screen(area);
+                            let corners = [
+                                (ResizeCorner::TopLeft, screen.left_top()),
+                                (ResizeCorner::TopRight, screen.right_top()),
+                                (ResizeCorner::BottomLeft, screen.left_bottom()),
+                                (ResizeCorner::BottomRight, screen.right_bottom()),
+                            ];
+                            let resize = corners
+                                .into_iter()
+                                .find(|(_, corner)| corner.distance(position) <= 9.0)
+                                .map(|(corner, _)| corner);
+                            if resize.is_some() || screen.contains(position) {
+                                hit = Some(RegionInteraction {
+                                    kind,
+                                    index,
+                                    original: area,
+                                    start: image_position,
+                                    resize,
+                                });
+                                break;
+                            }
+                        }
+                        if let Some(interaction) = hit {
+                            self.region_selected = Some((interaction.kind, interaction.index));
+                            self.region_interaction = Some(interaction);
+                            self.region_drag_start = None;
+                        } else {
+                            self.region_selected = None;
+                            self.region_interaction = None;
+                            self.region_drag_start = Some(image_position);
+                        }
+                    }
+                }
+            }
+            if let (Some(interaction), Some(position)) =
+                (self.region_interaction, response.interact_pointer_pos())
+            {
+                let current = pointer_to_image(position);
+                let delta = current - interaction.start;
+                let (x, y, width, height) = interaction.original;
+                let area = if let Some(corner) = interaction.resize {
+                    let mut left = x as f32;
+                    let mut top = y as f32;
+                    let mut right = (x + width) as f32;
+                    let mut bottom = (y + height) as f32;
+                    match corner {
+                        ResizeCorner::TopLeft => {
+                            left += delta.x;
+                            top += delta.y;
+                        }
+                        ResizeCorner::TopRight => {
+                            right += delta.x;
+                            top += delta.y;
+                        }
+                        ResizeCorner::BottomLeft => {
+                            left += delta.x;
+                            bottom += delta.y;
+                        }
+                        ResizeCorner::BottomRight => {
+                            right += delta.x;
+                            bottom += delta.y;
+                        }
+                    }
+                    left = left.clamp(0.0, size[0] as f32);
+                    right = right.clamp(0.0, size[0] as f32);
+                    top = top.clamp(0.0, size[1] as f32);
+                    bottom = bottom.clamp(0.0, size[1] as f32);
+                    let selection =
+                        egui::Rect::from_two_pos(egui::pos2(left, top), egui::pos2(right, bottom));
+                    (
+                        selection.min.x.floor() as u32,
+                        selection.min.y.floor() as u32,
+                        selection.width().round().max(2.0) as u32,
+                        selection.height().round().max(2.0) as u32,
+                    )
+                } else {
+                    let max_x = size[0] as f32 - width as f32;
+                    let max_y = size[1] as f32 - height as f32;
+                    (
+                        (x as f32 + delta.x).round().clamp(0.0, max_x.max(0.0)) as u32,
+                        (y as f32 + delta.y).round().clamp(0.0, max_y.max(0.0)) as u32,
+                        width,
+                        height,
+                    )
+                };
+                let bounded_x = area.0.min(size[0].saturating_sub(1) as u32);
+                let bounded_y = area.1.min(size[1].saturating_sub(1) as u32);
+                let bounded = (
+                    bounded_x,
+                    bounded_y,
+                    area.2
+                        .min((size[0] as u32).saturating_sub(bounded_x))
+                        .max(1),
+                    area.3
+                        .min((size[1] as u32).saturating_sub(bounded_y))
+                        .max(1),
+                );
+                if bounded.2 >= 3 && bounded.3 >= 3 {
+                    self.set_region_value(interaction.kind, interaction.index, bounded);
+                }
+            }
+
+            let draw_region = |kind: RegionKind,
+                               index: usize,
+                               region: (u32, u32, u32, u32),
+                               color: egui::Color32,
+                               label: &str| {
                 let screen_rect = region_to_screen(region);
-                painter.rect_stroke(screen_rect, 0.0, egui::Stroke::new(2.0, color));
+                let selected = self.region_selected == Some((kind, index));
+                painter.rect_stroke(
+                    screen_rect,
+                    0.0,
+                    egui::Stroke::new(if selected { 3.0 } else { 2.0 }, color),
+                );
                 painter.text(
                     screen_rect.left_top() + egui::vec2(3.0, 3.0),
                     egui::Align2::LEFT_TOP,
@@ -1961,10 +3500,25 @@ impl AscApp {
                     egui::FontId::proportional(11.0),
                     color,
                 );
+                if selected {
+                    for corner in [
+                        screen_rect.left_top(),
+                        screen_rect.right_top(),
+                        screen_rect.left_bottom(),
+                        screen_rect.right_bottom(),
+                    ] {
+                        painter.rect_filled(
+                            egui::Rect::from_center_size(corner, egui::vec2(9.0, 9.0)),
+                            1.0,
+                            color,
+                        );
+                    }
+                }
             };
-
             if self.enable_crop {
                 draw_region(
+                    RegionKind::Screenshot,
+                    0,
                     (self.crop_x, self.crop_y, self.crop_w, self.crop_h),
                     egui::Color32::from_rgb(255, 90, 90),
                     "Skärmklipp",
@@ -1972,6 +3526,8 @@ impl AscApp {
             }
             for (index, region) in self.ocr_regions.iter().copied().enumerate() {
                 draw_region(
+                    RegionKind::Ocr,
+                    index,
                     region,
                     egui::Color32::from_rgb(90, 170, 255),
                     &format!("OCR {}", index + 1),
@@ -1979,19 +3535,14 @@ impl AscApp {
             }
             for (index, region) in self.measurement_regions.iter().copied().enumerate() {
                 draw_region(
+                    RegionKind::Measurement,
+                    index,
                     region,
                     egui::Color32::from_rgb(255, 210, 70),
                     &format!("Mät {}", index + 1),
                 );
             }
 
-            if response.drag_started_by(egui::PointerButton::Primary) {
-                if let Some(position) = response.interact_pointer_pos() {
-                    if image_rect.contains(position) {
-                        self.region_drag_start = Some(pointer_to_image(position));
-                    }
-                }
-            }
             if let (Some(start), Some(position)) =
                 (self.region_drag_start, response.interact_pointer_pos())
             {
@@ -2014,7 +3565,9 @@ impl AscApp {
                 );
             }
             if response.drag_stopped_by(egui::PointerButton::Primary) {
-                if let (Some(start), Some(position)) = (
+                if self.region_interaction.take().is_some() {
+                    self.region_drag_start = None;
+                } else if let (Some(start), Some(position)) = (
                     self.region_drag_start.take(),
                     response.interact_pointer_pos(),
                 ) {
@@ -2033,13 +3586,20 @@ impl AscApp {
                                 self.crop_y = region.1;
                                 self.crop_w = region.2;
                                 self.crop_h = region.3;
+                                self.region_selected = Some((RegionKind::Screenshot, 0));
                             }
                             "ocr" => {
                                 self.enable_ocr = true;
                                 self.ocr_regions.push(region);
+                                self.region_selected =
+                                    Some((RegionKind::Ocr, self.ocr_regions.len() - 1));
                             }
                             _ => {
                                 self.measurement_regions.push(region);
+                                self.region_selected = Some((
+                                    RegionKind::Measurement,
+                                    self.measurement_regions.len() - 1,
+                                ));
                                 if self.measurement_regions.len() == 1 {
                                     self.indicator_x = region.0;
                                     self.indicator_y = region.1;
@@ -2067,6 +3627,16 @@ impl AscApp {
 
 impl eframe::App for AscApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let recording_stopped_by_hotkey = self
+            .automation_recorder
+            .as_ref()
+            .is_some_and(macro_recorder::MacroRecorder::is_finished);
+        if recording_stopped_by_hotkey {
+            self.stop_macro_recording();
+        } else if self.automation_recorder.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
         let folder_result =
             self.folder_receiver
                 .as_ref()
@@ -2082,26 +3652,6 @@ impl eframe::App for AscApp {
                 self.status_text = "Mapp vald.".to_string();
             } else {
                 self.status_text = "Mappval avbrutet.".to_string();
-            }
-        }
-
-        let image_picker_result =
-            self.automation_image_picker_receiver
-                .as_ref()
-                .and_then(|receiver| match receiver.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                });
-        if let Some(result) = image_picker_result {
-            self.automation_image_picker_receiver = None;
-            if let Some((index, path)) = result {
-                if let Some(step) = self.automation_steps.get_mut(index) {
-                    if step.kind == "click_image" {
-                        step.value = path;
-                        self.automation_status = "Referensbild vald.".to_string();
-                    }
-                }
             }
         }
 
@@ -2157,6 +3707,67 @@ impl eframe::App for AscApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
+        let mut presence_stopped = false;
+        let mut presence_changed = false;
+        if let Some(receiver) = self.presence_receiver.as_ref() {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    presence::Event::Sample { status, ocr_text } => {
+                        self.presence_last_ocr = ocr_text;
+                        if self.presence_current_status != Some(status) {
+                            let now = Local::now();
+                            if let Some(started) = self.presence_current_started.take() {
+                                if let Some(period) = self.presence_periods.last_mut() {
+                                    if period.ended_at.is_none() {
+                                        period.duration_seconds = started.elapsed().as_secs();
+                                        period.ended_at = Some(now.to_rfc3339());
+                                    }
+                                }
+                            }
+                            self.presence_current_status = Some(status);
+                            self.presence_current_started = Some(Instant::now());
+                            self.presence_periods.push(PresencePeriod {
+                                person: self.presence_person.trim().to_string(),
+                                status,
+                                started_at: now.to_rfc3339(),
+                                ended_at: None,
+                                duration_seconds: 0,
+                            });
+                            self.presence_status_text =
+                                format!("Status ändrad till {}.", status.label());
+                            presence_changed = true;
+                        }
+                    }
+                    presence::Event::Error(error) => {
+                        self.presence_status_text = format!("Statuskontroll: {error}");
+                    }
+                    presence::Event::Stopped => presence_stopped = true,
+                }
+            }
+        }
+        if presence_stopped {
+            if let Some(started) = self.presence_current_started.take() {
+                if let Some(period) = self.presence_periods.last_mut() {
+                    if period.ended_at.is_none() {
+                        period.duration_seconds = started.elapsed().as_secs();
+                        period.ended_at = Some(Local::now().to_rfc3339());
+                    }
+                }
+            }
+            self.presence_running = false;
+            self.presence_status_text = "Statusövervakningen stoppades.".to_string();
+            self.presence_receiver = None;
+            self.presence_control_sender = None;
+            presence_changed = true;
+        } else if self.presence_running {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        if presence_changed {
+            if let Err(error) = self.export_presence() {
+                self.presence_status_text = error;
+            }
+        }
+
         // Kontrollera om vi tagit emot meddelanden från bakgrundstråden
         let mut should_clear_receiver = false;
         let mut analysis_changed = false;
@@ -2204,6 +3815,7 @@ impl eframe::App for AscApp {
         }
         if should_clear_receiver {
             self.log_receiver = None;
+            self.control_sender = None;
         }
         if analysis_changed {
             self.export_pending = true;
@@ -2235,6 +3847,15 @@ impl eframe::App for AscApp {
                 );
                 ui.selectable_value(
                     &mut self.active_tab,
+                    "presence".to_string(),
+                    if self.presence_running {
+                        "Teams-status • körs"
+                    } else {
+                        "Teams-status"
+                    },
+                );
+                ui.selectable_value(
+                    &mut self.active_tab,
                     "mouse".to_string(),
                     if self.mouse_running {
                         "Muspekar-simulering • körs"
@@ -2261,6 +3882,10 @@ impl eframe::App for AscApp {
             self.show_automation_tab(ctx);
             return;
         }
+        if self.active_tab == "presence" {
+            self.show_presence_tab(ctx);
+            return;
+        }
 
         // Definiera det övergripande gränssnittet
         egui::SidePanel::left("left_panel")
@@ -2270,7 +3895,7 @@ impl eframe::App for AscApp {
             .max_width(520.0)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.heading("ASC - Skärmklipp & Analys");
+                    ui.heading("Anteckningar - ASC");
                     ui.colored_label(
                         egui::Color32::from_rgb(100, 110, 240),
                         "Infödd Rust-version",
@@ -2596,7 +4221,7 @@ impl eframe::App for AscApp {
                     let btn_text = if self.mode == "live" {
                         "Stoppa övervakning"
                     } else {
-                        "Stoppar..."
+                        "Stoppa efterhandsanalys"
                     };
                     if ui
                         .add_sized(
@@ -2604,9 +4229,12 @@ impl eframe::App for AscApp {
                             egui::Button::new(btn_text).fill(egui::Color32::from_rgb(180, 60, 60)),
                         )
                         .clicked()
-                        && self.mode == "live"
                     {
-                        self.stop_monitoring();
+                        if self.mode == "live" {
+                            self.stop_monitoring();
+                        } else {
+                            self.stop_offline_analysis();
+                        }
                     }
                     if self.mode == "live"
                         && ui
@@ -2787,6 +4415,32 @@ fn csv_field(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+fn presence_color(status: presence::PresenceStatus) -> egui::Color32 {
+    match status {
+        presence::PresenceStatus::Available => egui::Color32::from_rgb(50, 180, 90),
+        presence::PresenceStatus::Busy => egui::Color32::from_rgb(210, 65, 65),
+        presence::PresenceStatus::DoNotDisturb => egui::Color32::from_rgb(150, 35, 45),
+        presence::PresenceStatus::Away | presence::PresenceStatus::BeRightBack => {
+            egui::Color32::from_rgb(220, 175, 45)
+        }
+        presence::PresenceStatus::Offline => egui::Color32::from_gray(125),
+        presence::PresenceStatus::Unknown => egui::Color32::from_rgb(100, 125, 160),
+    }
+}
+
+fn format_duration(seconds: u64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours} h {minutes} min")
+    } else if minutes > 0 {
+        format!("{minutes} min {seconds} s")
+    } else {
+        format!("{seconds} s")
+    }
+}
+
 fn write_analysis(
     directory: &Path,
     logs: &[LogItem],
@@ -2801,16 +4455,33 @@ fn write_analysis(
     fs::write(directory.join("asc-analysis.json"), json)
         .map_err(|error| format!("kunde inte skriva asc-analysis.json: {error}"))?;
 
-    let mut csv =
-        String::from("timestamp,file_name,pixel_diff_percent,changed_pixels,ocr_text,is_changed\n");
+    let mut csv = String::from(
+        "timestamp,file_name,pixel_diff_percent,changed_pixels,change_x,change_y,change_width,change_height,change_summary,ocr_text,is_changed\n",
+    );
     for item in logs {
+        let (x, y, width, height) = item
+            .change_bounds
+            .map(|bounds| {
+                (
+                    bounds.x.to_string(),
+                    bounds.y.to_string(),
+                    bounds.width.to_string(),
+                    bounds.height.to_string(),
+                )
+            })
+            .unwrap_or_default();
         let _ = writeln!(
             csv,
-            "{},{},{:.6},{},{},{}",
+            "{},{},{:.6},{},{},{},{},{},{},{},{}",
             csv_field(&item.timestamp),
             csv_field(&item.file_name),
             item.pixel_diff * 100.0,
             item.changed_pixels,
+            x,
+            y,
+            width,
+            height,
+            csv_field(&item.change_summary),
             csv_field(&item.ocr_text),
             item.is_changed
         );
@@ -2841,10 +4512,29 @@ fn write_analysis(
     Ok(())
 }
 
+fn change_summary(
+    changed_pixels: u64,
+    bounds: Option<analysis::ChangeBounds>,
+    ocr_changed: bool,
+) -> String {
+    let pixel_summary = match bounds {
+        Some(bounds) => format!(
+            "{changed_pixels} px vid x={}, y={} ({} × {})",
+            bounds.x, bounds.y, bounds.width, bounds.height
+        ),
+        None => "Inga bildpixlar ändrades".to_string(),
+    };
+    if ocr_changed {
+        format!("OCR-text ändrad; {pixel_summary}")
+    } else {
+        pixel_summary
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ASC - Skärmklipp & Analys")
+            .with_title("Anteckningar - ASC")
             .with_inner_size([1024.0, 768.0]),
         ..Default::default()
     };
@@ -2858,13 +4548,26 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod export_tests {
-    use super::{csv_field, write_analysis, KeywordColorResult, LogItem};
+    use super::{
+        csv_field, stop_requested, write_analysis, ControlMessage, KeywordColorResult, LogItem,
+    };
     use std::fs;
+    use std::sync::mpsc::channel;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn csv_fields_escape_quotes() {
         assert_eq!(csv_field("text, \"citat\""), "\"text, \"\"citat\"\"\"");
+    }
+
+    #[test]
+    fn stop_signal_is_detected_by_worker() {
+        let (sender, receiver) = channel();
+        assert!(!stop_requested(&receiver));
+        sender
+            .send(ControlMessage::Stop)
+            .expect("stoppmeddelandet ska kunna skickas");
+        assert!(stop_requested(&receiver));
     }
 
     #[test]
@@ -2880,6 +4583,13 @@ mod export_tests {
             timestamp: "12:34:56".to_string(),
             pixel_diff: 0.0125,
             changed_pixels: 42,
+            change_bounds: Some(crate::analysis::ChangeBounds {
+                x: 10,
+                y: 20,
+                width: 4,
+                height: 5,
+            }),
+            change_summary: "42 px vid x=10, y=20 (4 × 5)".to_string(),
             ocr_text: "Rad 1, \"test\"".to_string(),
             is_changed: true,
             file_name: "capture.png".to_string(),
@@ -2901,8 +4611,11 @@ mod export_tests {
             fs::read_to_string(directory.join("asc-analysis.json")).expect("JSON-filen ska finnas");
         assert!(csv.contains("1.250000"));
         assert!(csv.contains(",42,"));
+        assert!(csv.contains(",10,20,4,5,"));
+        assert!(csv.contains("42 px vid x=10"));
         assert!(csv.contains("\"Rad 1, \"\"test\"\"\""));
         assert!(json.contains("\"is_changed\": true"));
+        assert!(json.contains("\"change_bounds\""));
         let keyword_csv = fs::read_to_string(directory.join("asc-keyword-colors.csv"))
             .expect("ord-/färg-CSV ska finnas");
         assert!(keyword_csv.contains("\"öppet\",grön"));

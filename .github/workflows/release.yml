@@ -47,14 +47,15 @@ jobs:
           fi
 
           gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --title "ASC Screen Analyzer v$VERSION" \
+            gh release create "$TAG" --title "Anteckningar - ASC v$VERSION" \
               --notes "Automatisk byggnation av infödda Rust-binärer (.exe och .tar.gz)." || true
 
           if [ "${{ matrix.platform }}" = "windows-latest" ]; then
-            gh release upload "$TAG" target/release/asc-screen-analyzer.exe#ASC_Screen_Analyzer_Portable.exe --clobber
+            cp target/release/asc-screen-analyzer.exe Anteckningar_ASC_Portable.exe
+            gh release upload "$TAG" Anteckningar_ASC_Portable.exe --clobber
           else
-            tar -czf ASC_Screen_Analyzer_mac.tar.gz -C target/release asc-screen-analyzer
-            gh release upload "$TAG" ASC_Screen_Analyzer_mac.tar.gz --clobber
+            tar -czf Anteckningar_ASC_mac.tar.gz -C target/release asc-screen-analyzer
+            gh release upload "$TAG" Anteckningar_ASC_mac.tar.gz --clobber
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
