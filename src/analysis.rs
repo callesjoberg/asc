@@ -22,10 +22,10 @@ pub fn compare_images(img1: &DynamicImage, img2: &DynamicImage) -> f64 {
             let p1 = img1.get_pixel(x, y);
             let p2 = img2.get_pixel(x, y);
 
-            let r_diff = (p1[0] as i32 - p2[0] as i32).abs() as u32;
-            let g_diff = (p1[1] as i32 - p2[1] as i32).abs() as u32;
-            let b_diff = (p1[2] as i32 - p2[2] as i32).abs() as u32;
-            let a_diff = (p1[3] as i32 - p2[3] as i32).abs() as u32;
+            let r_diff = (p1[0] as i32 - p2[0] as i32).unsigned_abs();
+            let g_diff = (p1[1] as i32 - p2[1] as i32).unsigned_abs();
+            let b_diff = (p1[2] as i32 - p2[2] as i32).unsigned_abs();
+            let a_diff = (p1[3] as i32 - p2[3] as i32).unsigned_abs();
 
             diff_sum += (r_diff + g_diff + b_diff + a_diff) as u64;
             pixels_count += 1;

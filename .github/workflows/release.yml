@@ -2,8 +2,8 @@ name: Release
 on:
   push:
     tags:
-      - 'v*' # Körs när du pushar en tagg som startar med v (t.ex. v0.1.0)
-  workflow_dispatch: # Låter dig starta byggnaden manuellt via GitHub Actions fliken
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
   release:
@@ -14,51 +14,48 @@ jobs:
       matrix:
         include:
           - platform: 'macos-latest'
-            build-cmd: 'clang -O3 -framework Foundation -framework AppKit -framework Vision src-ocr/macos/ocr-helper.m -o src-tauri/resources/ocr-helper-macos'
+            build-cmd: 'mkdir -p resources && clang -O3 -framework Foundation -framework AppKit -framework Vision src-ocr/macos/ocr-helper.m -o resources/ocr-helper-macos'
           - platform: 'windows-latest'
-            build-cmd: 'dotnet build -c Release src-ocr/windows/OcrHelper.csproj -o src-tauri/resources/ && cp src-tauri/resources/OcrHelper.exe src-tauri/resources/ocr-helper-win.exe'
+            build-cmd: 'mkdir -p resources && dotnet build -c Release src-ocr/windows/OcrHelper.csproj -o resources/ && cp resources/OcrHelper.exe resources/ocr-helper-win.exe'
     
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
 
       - name: Build OCR Helper
         run: ${{ matrix.build-cmd }}
         shell: bash
 
-      - name: Install frontend dependencies
-        run: npm install
+      - name: Build App
+        run: cargo build --release
+        shell: bash
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: v__VERSION__ # Använder versionen från package.json
-          releaseName: 'ASC Screen Analyzer v__VERSION__'
-          releaseBody: 'Automatisk byggnation av installerare för Windows (.exe/.msi) och macOS (.dmg).'
-          releaseDraft: true
-          prerelease: false
-
-      - name: Upload Standalone Windows Executable
-        if: matrix.platform == 'windows-latest'
+      - name: Upload Release Asset
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          gh release upload "v$VERSION" src-tauri/target/release/tauri-app.exe#ASC_Screen_Analyzer_Portable.exe --clobber
+          VERSION=$(grep '^version =' Cargo.toml | head -n1 | cut -d'"' -f2)
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="v$VERSION"
+          fi
+
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "ASC Screen Analyzer v$VERSION" --draft \
+              --notes "Automatisk byggnation av infödda Rust-binärer (.exe och .tar.gz)." || true
+
+          if [ "${{ matrix.platform }}" = "windows-latest" ]; then
+            gh release upload "$TAG" target/release/asc-screen-analyzer.exe#ASC_Screen_Analyzer_Portable.exe --clobber
+          else
+            tar -czf ASC_Screen_Analyzer_mac.tar.gz -C target/release asc-screen-analyzer
+            gh release upload "$TAG" ASC_Screen_Analyzer_mac.tar.gz --clobber
+          fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash

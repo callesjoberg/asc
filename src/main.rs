@@ -1,0 +1,958 @@
+mod analysis;
+mod capture;
+mod ocr;
+
+use chrono::Local;
+use eframe::egui;
+use std::fs;
+use std::path::Path;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::Duration;
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct LogItem {
+    timestamp: String,
+    pixel_diff: f64,
+    ocr_text: String,
+    is_changed: bool,
+    file_name: String,
+}
+
+enum ControlMessage {
+    Stop,
+}
+
+enum WorkerMessage {
+    Log(LogItem),
+    Preview(Vec<u8>, usize, usize), // RGBA-pixlar, bredd, höjd
+    Error(String),
+    OfflineDone(String),
+}
+
+struct AscApp {
+    // Gränssnittsinställningar
+    mode: String,        // "live" eller "offline"
+    source_type: String, // "window" eller "screen"
+    selected_source_id: u32,
+    save_dir: String,
+    interval_secs: u64,
+    threshold_pct: f64,
+    enable_crop: bool,
+    crop_x: u32,
+    crop_y: u32,
+    crop_w: u32,
+    crop_h: u32,
+    enable_ocr: bool,
+    enable_ocr_crop: bool,
+    ocr_x: u32,
+    ocr_y: u32,
+    ocr_w: u32,
+    ocr_h: u32,
+
+    // Status och historik
+    is_running: bool,
+    status_text: String,
+    logs: Vec<LogItem>,
+    diffs_history: Vec<f64>,
+    total_captures: usize,
+    total_changes: usize,
+
+    // Källlistor (cachar)
+    windows: Vec<capture::WindowInfo>,
+    monitors: Vec<capture::MonitorInfo>,
+
+    // Bildförhandsgranskning
+    preview_texture: Option<egui::TextureHandle>,
+    preview_size: Option<[usize; 2]>,
+
+    // Trådkommunikation
+    log_receiver: Option<Receiver<WorkerMessage>>,
+    control_sender: Option<Sender<ControlMessage>>,
+}
+
+impl Default for AscApp {
+    fn default() -> Self {
+        let mut app = Self {
+            mode: "live".to_string(),
+            source_type: "screen".to_string(),
+            selected_source_id: 0,
+            save_dir: String::new(),
+            interval_secs: 5,
+            threshold_pct: 1.0,
+            enable_crop: false,
+            crop_x: 0,
+            crop_y: 0,
+            crop_w: 800,
+            crop_h: 600,
+            enable_ocr: false,
+            enable_ocr_crop: false,
+            ocr_x: 0,
+            ocr_y: 0,
+            ocr_w: 300,
+            ocr_h: 50,
+            is_running: false,
+            status_text: "Klar att starta".to_string(),
+            logs: Vec::new(),
+            diffs_history: Vec::new(),
+            total_captures: 0,
+            total_changes: 0,
+            windows: Vec::new(),
+            monitors: Vec::new(),
+            preview_texture: None,
+            preview_size: None,
+            log_receiver: None,
+            control_sender: None,
+        };
+        app.refresh_sources();
+        app
+    }
+}
+
+impl AscApp {
+    fn refresh_sources(&mut self) {
+        if let Ok(w) = capture::list_windows() {
+            self.windows = w;
+        }
+        if let Ok(m) = capture::list_monitors() {
+            self.monitors = m;
+        }
+
+        // Återställ vald källa om den inte längre existerar
+        if self.source_type == "window" {
+            if !self.windows.iter().any(|w| w.id == self.selected_source_id) {
+                self.selected_source_id = self.windows.first().map(|w| w.id).unwrap_or(0);
+            }
+        } else {
+            if !self
+                .monitors
+                .iter()
+                .any(|m| m.id == self.selected_source_id)
+            {
+                self.selected_source_id = self.monitors.first().map(|m| m.id).unwrap_or(0);
+            }
+        }
+    }
+
+    fn start_monitoring(&mut self, ctx: egui::Context) {
+        let source_exists = if self.source_type == "window" {
+            self.windows
+                .iter()
+                .any(|window| window.id == self.selected_source_id)
+        } else {
+            self.monitors
+                .iter()
+                .any(|monitor| monitor.id == self.selected_source_id)
+        };
+        if !source_exists {
+            self.status_text = "Fel: Välj en tillgänglig källa först.".to_string();
+            return;
+        }
+        if !self.save_dir.is_empty() && !Path::new(&self.save_dir).is_dir() {
+            self.status_text = "Fel: Den valda målmappen finns inte.".to_string();
+            return;
+        }
+
+        self.logs.clear();
+        self.diffs_history.clear();
+        self.total_captures = 0;
+        self.total_changes = 0;
+        self.preview_texture = None;
+        self.preview_size = None;
+
+        let (log_tx, log_rx) = channel();
+        let (control_tx, control_rx) = channel();
+
+        self.log_receiver = Some(log_rx);
+        self.control_sender = Some(control_tx);
+        self.is_running = true;
+        self.status_text = "Övervakar...".to_string();
+
+        let source_type = self.source_type.clone();
+        let source_id = self.selected_source_id;
+        let save_dir = self.save_dir.clone();
+        let interval_secs = self.interval_secs;
+        let threshold = self.threshold_pct / 100.0;
+
+        let crop_area = if self.enable_crop {
+            Some((self.crop_x, self.crop_y, self.crop_w, self.crop_h))
+        } else {
+            None
+        };
+
+        let enable_ocr = self.enable_ocr;
+        let ocr_area = if self.enable_ocr && self.enable_ocr_crop {
+            Some((self.ocr_x, self.ocr_y, self.ocr_w, self.ocr_h))
+        } else {
+            None
+        };
+
+        std::thread::spawn(move || {
+            let mut prev_img: Option<image::DynamicImage> = None;
+            let mut prev_ocr: Option<String> = None;
+            loop {
+                // Kontrollera om vi ska stoppa tråden
+                if let Ok(ControlMessage::Stop) = control_rx.try_recv() {
+                    break;
+                }
+
+                // Ta skärmklipp
+                match capture::capture_source(&source_type, source_id, crop_area) {
+                    Ok(img) => {
+                        let timestamp = Local::now().format("%H:%M:%S").to_string();
+                        let file_timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+
+                        // Spara fil om mapp angivits
+                        let mut file_name = String::new();
+                        if !save_dir.is_empty() {
+                            let fname = format!("capture_{}.png", file_timestamp);
+                            let fpath = Path::new(&save_dir).join(&fname);
+                            if img.save(&fpath).is_ok() {
+                                file_name = fname;
+                            }
+                        }
+
+                        // Beräkna bildskillnad
+                        let mut diff = 0.0;
+                        if let Some(ref p_img) = prev_img {
+                            diff = analysis::compare_images(p_img, &img);
+                        }
+
+                        // OCR (Textigenkänning)
+                        let mut ocr_text = String::new();
+                        if enable_ocr {
+                            let ocr_img = if let Some(area) = ocr_area {
+                                capture::crop_image(&img, area)
+                            } else {
+                                img.clone()
+                            };
+
+                            let temp_path = std::env::temp_dir().join(format!(
+                                "asc_ocr_{}_{}.png",
+                                std::process::id(),
+                                file_timestamp
+                            ));
+                            if ocr_img.save(&temp_path).is_ok() {
+                                match ocr::run_ocr(&temp_path.to_string_lossy()) {
+                                    Ok(text) => ocr_text = text,
+                                    Err(error) => ocr_text = format!("OCR-fel: {error}"),
+                                }
+                                let _ = fs::remove_file(temp_path);
+                            }
+                        }
+
+                        let is_changed = if prev_img.is_some() {
+                            if enable_ocr {
+                                prev_ocr
+                                    .as_ref()
+                                    .is_some_and(|previous| ocr_text.trim() != previous.trim())
+                            } else {
+                                diff >= threshold
+                            }
+                        } else {
+                            false
+                        };
+
+                        prev_img = Some(img.clone());
+                        if enable_ocr {
+                            prev_ocr = Some(ocr_text.clone());
+                        }
+
+                        // Skicka logg
+                        let log_item = LogItem {
+                            timestamp,
+                            pixel_diff: diff,
+                            ocr_text,
+                            is_changed,
+                            file_name,
+                        };
+                        let _ = log_tx.send(WorkerMessage::Log(log_item));
+
+                        // Skicka förhandsvisningsbild (RGBA)
+                        let rgba = img.to_rgba8();
+                        let w = rgba.width() as usize;
+                        let h = rgba.height() as usize;
+                        let raw = rgba.into_raw();
+                        let _ = log_tx.send(WorkerMessage::Preview(raw, w, h));
+
+                        ctx.request_repaint();
+                    }
+                    Err(e) => {
+                        let _ = log_tx.send(WorkerMessage::Error(format!("Klippfel: {}", e)));
+                        ctx.request_repaint();
+                    }
+                }
+
+                // Vänta inställt intervall (i mindre steg för att snabbare kunna avsluta tråden)
+                for _ in 0..(interval_secs * 10) {
+                    if let Ok(ControlMessage::Stop) = control_rx.try_recv() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+    }
+
+    fn stop_monitoring(&mut self) {
+        if let Some(ref sender) = self.control_sender {
+            let _ = sender.send(ControlMessage::Stop);
+        }
+        self.is_running = false;
+        self.status_text = "Avslutad".to_string();
+        self.log_receiver = None;
+        self.control_sender = None;
+    }
+
+    fn start_offline_analysis(&mut self, ctx: egui::Context) {
+        if self.save_dir.is_empty() || !Path::new(&self.save_dir).is_dir() {
+            self.status_text = "Fel: Välj en befintlig analysmapp först.".to_string();
+            return;
+        }
+
+        self.logs.clear();
+        self.diffs_history.clear();
+        self.total_captures = 0;
+        self.total_changes = 0;
+        self.preview_texture = None;
+        self.preview_size = None;
+
+        let (log_tx, log_rx) = channel();
+        self.log_receiver = Some(log_rx);
+        self.is_running = true;
+        self.status_text = "Kör offline-analys...".to_string();
+
+        let save_dir = self.save_dir.clone();
+        let threshold = self.threshold_pct / 100.0;
+        let crop_area = if self.enable_crop {
+            Some((self.crop_x, self.crop_y, self.crop_w, self.crop_h))
+        } else {
+            None
+        };
+        let enable_ocr = self.enable_ocr;
+        let ocr_area = if self.enable_ocr && self.enable_ocr_crop {
+            Some((self.ocr_x, self.ocr_y, self.ocr_w, self.ocr_h))
+        } else {
+            None
+        };
+
+        std::thread::spawn(move || {
+            let dir_path = Path::new(&save_dir);
+            let mut entries = Vec::new();
+            if let Ok(read_dir) = fs::read_dir(dir_path) {
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let ext = path
+                            .extension()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_lowercase();
+                        if ext == "png" || ext == "jpg" || ext == "jpeg" {
+                            entries.push(path);
+                        }
+                    }
+                }
+            }
+
+            // Sortera efter filnamn (tidsordning)
+            entries.sort();
+
+            if entries.is_empty() {
+                let _ = log_tx.send(WorkerMessage::OfflineDone(
+                    "Inga bildfiler hittades i mappen.".to_string(),
+                ));
+                ctx.request_repaint();
+                return;
+            }
+
+            let mut prev_img: Option<image::DynamicImage> = None;
+            let mut prev_ocr: Option<String> = None;
+            for (idx, path) in entries.iter().enumerate() {
+                match image::open(path) {
+                    Ok(original_img) => {
+                        let img = if let Some(area) = crop_area {
+                            capture::crop_image(&original_img, area)
+                        } else {
+                            original_img
+                        };
+                        let file_name = path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        let timestamp = format!("#{}", idx + 1);
+
+                        // Beräkna bildskillnad
+                        let mut diff = 0.0;
+                        if let Some(ref p_img) = prev_img {
+                            diff = analysis::compare_images(p_img, &img);
+                        }
+
+                        // OCR (Textigenkänning)
+                        let mut ocr_text = String::new();
+                        if enable_ocr {
+                            let ocr_img = if let Some(area) = ocr_area {
+                                capture::crop_image(&img, area)
+                            } else {
+                                img.clone()
+                            };
+
+                            let temp_path = std::env::temp_dir().join(format!(
+                                "asc_ocr_{}_{}.png",
+                                std::process::id(),
+                                idx
+                            ));
+                            if ocr_img.save(&temp_path).is_ok() {
+                                match ocr::run_ocr(&temp_path.to_string_lossy()) {
+                                    Ok(text) => ocr_text = text,
+                                    Err(error) => ocr_text = format!("OCR-fel: {error}"),
+                                }
+                                let _ = fs::remove_file(temp_path);
+                            }
+                        }
+
+                        let is_changed = if prev_img.is_some() {
+                            if enable_ocr {
+                                prev_ocr
+                                    .as_ref()
+                                    .is_some_and(|previous| ocr_text.trim() != previous.trim())
+                            } else {
+                                diff >= threshold
+                            }
+                        } else {
+                            false
+                        };
+
+                        prev_img = Some(img.clone());
+                        if enable_ocr {
+                            prev_ocr = Some(ocr_text.clone());
+                        }
+
+                        // Skicka logg
+                        let log_item = LogItem {
+                            timestamp,
+                            pixel_diff: diff,
+                            ocr_text,
+                            is_changed,
+                            file_name,
+                        };
+                        let _ = log_tx.send(WorkerMessage::Log(log_item));
+
+                        // Skicka förhandsvisningsbild (RGBA)
+                        let rgba = img.to_rgba8();
+                        let w = rgba.width() as usize;
+                        let h = rgba.height() as usize;
+                        let raw = rgba.into_raw();
+                        let _ = log_tx.send(WorkerMessage::Preview(raw, w, h));
+
+                        ctx.request_repaint();
+                        std::thread::sleep(Duration::from_millis(50)); // Liten fördröjning för visuell återkoppling
+                    }
+                    Err(e) => {
+                        let _ = log_tx.send(WorkerMessage::Error(format!(
+                            "Kunde inte öppna {}: {}",
+                            path.display(),
+                            e
+                        )));
+                        ctx.request_repaint();
+                    }
+                }
+            }
+
+            let _ = log_tx.send(WorkerMessage::OfflineDone(format!(
+                "Klart! Analyserade {} bilder.",
+                entries.len()
+            )));
+            ctx.request_repaint();
+        });
+    }
+}
+
+impl eframe::App for AscApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Kontrollera om vi tagit emot meddelanden från bakgrundstråden
+        let mut should_clear_receiver = false;
+        if let Some(ref receiver) = self.log_receiver {
+            while let Ok(msg) = receiver.try_recv() {
+                match msg {
+                    WorkerMessage::Log(item) => {
+                        self.total_captures += 1;
+                        if item.is_changed {
+                            self.total_changes += 1;
+                        }
+                        self.diffs_history.push(item.pixel_diff);
+                        self.logs.push(item);
+                    }
+                    WorkerMessage::Preview(rgba_bytes, w, h) => {
+                        let color_image =
+                            egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba_bytes);
+                        self.preview_texture = Some(ctx.load_texture(
+                            "preview_image",
+                            color_image,
+                            egui::TextureOptions::default(),
+                        ));
+                        self.preview_size = Some([w, h]);
+                    }
+                    WorkerMessage::Error(err) => {
+                        self.status_text = format!("Fel: {}", err);
+                    }
+                    WorkerMessage::OfflineDone(msg) => {
+                        self.status_text = msg;
+                        self.is_running = false;
+                        should_clear_receiver = true;
+                    }
+                }
+            }
+        }
+        if should_clear_receiver {
+            self.log_receiver = None;
+        }
+
+        // Definiera det övergripande gränssnittet
+        egui::SidePanel::left("left_panel")
+            .resizable(false)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading("ASC - Skärmklipp & Analys");
+                    ui.colored_label(
+                        egui::Color32::from_rgb(100, 110, 240),
+                        "Infödd Rust-version",
+                    );
+                });
+                ui.separator();
+
+                ui.add_enabled_ui(!self.is_running, |ui| {
+                    // Lägeval
+                    ui.label("Läge:");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.mode, "live".to_string(), "Live-övervakning");
+                        ui.radio_value(&mut self.mode, "offline".to_string(), "Efterhandsanalys");
+                    });
+                    ui.add_space(5.0);
+
+                    // Källa
+                    if self.mode == "live" {
+                        ui.horizontal(|ui| {
+                            ui.label("Källtyp:");
+                            if ui
+                                .radio_value(&mut self.source_type, "screen".to_string(), "Skärm")
+                                .clicked()
+                            {
+                                self.refresh_sources();
+                            }
+                            if ui
+                                .radio_value(&mut self.source_type, "window".to_string(), "Fönster")
+                                .clicked()
+                            {
+                                self.refresh_sources();
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Källa:");
+                            let combobox_width = 200.0;
+                            if self.source_type == "window" {
+                                egui::ComboBox::from_id_source("window_combo")
+                                    .width(combobox_width)
+                                    .selected_text(
+                                        self.windows
+                                            .iter()
+                                            .find(|w| w.id == self.selected_source_id)
+                                            .map(|w| format!("{} - {}", w.app_name, w.title))
+                                            .unwrap_or_else(|| "Välj fönster...".to_string()),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for w in &self.windows {
+                                            ui.selectable_value(
+                                                &mut self.selected_source_id,
+                                                w.id,
+                                                format!("{} - {}", w.app_name, w.title),
+                                            );
+                                        }
+                                    });
+                            } else {
+                                egui::ComboBox::from_id_source("screen_combo")
+                                    .width(combobox_width)
+                                    .selected_text(
+                                        self.monitors
+                                            .iter()
+                                            .find(|m| m.id == self.selected_source_id)
+                                            .map(|m| m.name.clone())
+                                            .unwrap_or_else(|| "Välj skärm...".to_string()),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for m in &self.monitors {
+                                            ui.selectable_value(
+                                                &mut self.selected_source_id,
+                                                m.id,
+                                                m.name.clone(),
+                                            );
+                                        }
+                                    });
+                            }
+
+                            if ui
+                                .button("🔄")
+                                .on_hover_text("Uppdatera fönsterlista")
+                                .clicked()
+                            {
+                                self.refresh_sources();
+                            }
+                        });
+                        ui.add_space(5.0);
+                    }
+
+                    // Spara i mapp (RFD Dialog)
+                    ui.label(if self.mode == "live" {
+                        "Spara skärmklipp i mapp (valfritt):"
+                    } else {
+                        "Analysmapp (Bilder):"
+                    });
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.save_dir);
+                        if ui.button("Bläddra...").clicked() {
+                            if let Some(folder) =
+                                rfd::FileDialog::new().set_title("Välj mapp").pick_folder()
+                            {
+                                self.save_dir = folder.to_string_lossy().to_string();
+                            }
+                        }
+                    });
+                    ui.add_space(5.0);
+
+                    // Parametrar
+                    if self.mode == "live" {
+                        ui.horizontal(|ui| {
+                            ui.label("Intervall:");
+                            ui.add(egui::Slider::new(&mut self.interval_secs, 1..=120).text("sek"));
+                        });
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label("Jämförelse-tröskel:");
+                        ui.add(egui::Slider::new(&mut self.threshold_pct, 0.1..=10.0).text("%"));
+                    });
+                    ui.add_space(8.0);
+
+                    // Beskärning
+                    ui.checkbox(&mut self.enable_crop, "Beskär skärmklipp");
+                    if self.enable_crop {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("X:");
+                                ui.add(egui::DragValue::new(&mut self.crop_x));
+                                ui.label("Y:");
+                                ui.add(egui::DragValue::new(&mut self.crop_y));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Bredd:");
+                                ui.add(egui::DragValue::new(&mut self.crop_w));
+                                ui.label("Höjd:");
+                                ui.add(egui::DragValue::new(&mut self.crop_h));
+                            });
+                        });
+                    }
+                    ui.add_space(5.0);
+
+                    // OCR
+                    ui.checkbox(&mut self.enable_ocr, "Aktivera textigenkänning (OCR)");
+                    if self.enable_ocr {
+                        ui.group(|ui| {
+                            ui.checkbox(&mut self.enable_ocr_crop, "Beskär OCR-område");
+                            if self.enable_ocr_crop {
+                                ui.horizontal(|ui| {
+                                    ui.label("X:");
+                                    ui.add(egui::DragValue::new(&mut self.ocr_x));
+                                    ui.label("Y:");
+                                    ui.add(egui::DragValue::new(&mut self.ocr_y));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Bredd:");
+                                    ui.add(egui::DragValue::new(&mut self.ocr_w));
+                                    ui.label("Höjd:");
+                                    ui.add(egui::DragValue::new(&mut self.ocr_h));
+                                });
+                            }
+                        });
+                    }
+                });
+
+                ui.add_space(15.0);
+                ui.separator();
+                ui.add_space(5.0);
+
+                // Start/Stopp-knapp
+                if !self.is_running {
+                    let btn_text = if self.mode == "live" {
+                        "Starta övervakning"
+                    } else {
+                        "Starta offline-analys"
+                    };
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 40.0],
+                            egui::Button::new(btn_text).fill(egui::Color32::from_rgb(60, 160, 60)),
+                        )
+                        .clicked()
+                    {
+                        if self.mode == "live" {
+                            self.start_monitoring(ctx.clone());
+                        } else {
+                            self.start_offline_analysis(ctx.clone());
+                        }
+                    }
+                } else {
+                    let btn_text = if self.mode == "live" {
+                        "Stoppa övervakning"
+                    } else {
+                        "Stoppar..."
+                    };
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 40.0],
+                            egui::Button::new(btn_text).fill(egui::Color32::from_rgb(180, 60, 60)),
+                        )
+                        .clicked()
+                        && self.mode == "live"
+                    {
+                        self.stop_monitoring();
+                    }
+                }
+
+                // Visa status
+                ui.add_space(15.0);
+                ui.horizontal(|ui| {
+                    ui.label("Status:");
+                    ui.colored_label(
+                        if self.is_running {
+                            egui::Color32::GREEN
+                        } else {
+                            egui::Color32::LIGHT_GRAY
+                        },
+                        &self.status_text,
+                    );
+                });
+            });
+
+        // Huvudyta
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Statistikpanel
+            ui.horizontal(|ui| {
+                ui.columns(3, |columns| {
+                    columns[0].vertical(|ui| {
+                        ui.label("Skärmklipp:");
+                        ui.heading(self.total_captures.to_string());
+                    });
+                    columns[1].vertical(|ui| {
+                        ui.label("Förändringar:");
+                        ui.heading(self.total_changes.to_string());
+                    });
+                    columns[2].vertical(|ui| {
+                        ui.label("Genomsnittlig diff:");
+                        let avg = if self.diffs_history.is_empty() {
+                            0.0
+                        } else {
+                            (self.diffs_history.iter().sum::<f64>()
+                                / self.diffs_history.len() as f64)
+                                * 100.0
+                        };
+                        ui.heading(format!("{:.2}%", avg));
+                    });
+                });
+            });
+            ui.separator();
+
+            // Skillnadsgraf (Egengjord linjegraf ritad via Painter)
+            ui.label("Skillnad över tid (procent):");
+            let graph_height = 140.0;
+            let (rect, _response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), graph_height),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(200));
+
+            // Rita rutnät och linje
+            let pad_left = 35.0;
+            let pad_right = 10.0;
+            let pad_top = 10.0;
+            let pad_bottom = 15.0;
+            let draw_w = rect.width() - pad_left - pad_right;
+            let draw_h = rect.height() - pad_top - pad_bottom;
+
+            // Beräkna max y
+            let mut max_y_pct = 5.0;
+            for &val in &self.diffs_history {
+                if val * 100.0 > max_y_pct {
+                    max_y_pct = val * 100.0 * 1.15;
+                }
+            }
+
+            // Rita rutnät (linjer och etiketter)
+            for i in 0..=4 {
+                let pct = (max_y_pct / 4.0) * i as f64;
+                let y = rect.bottom() - pad_bottom - (draw_h * (pct / max_y_pct) as f32);
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + pad_left, y),
+                        egui::pos2(rect.right() - pad_right, y),
+                    ],
+                    egui::Stroke::new(1.0, egui::Color32::from_white_alpha(15)),
+                );
+                painter.text(
+                    egui::pos2(rect.left() + pad_left - 5.0, y),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("{:.1}%", pct),
+                    egui::FontId::proportional(9.0),
+                    egui::Color32::GRAY,
+                );
+            }
+
+            // Rita datapunkter
+            if self.diffs_history.len() >= 2 {
+                let history_slice = if self.diffs_history.len() > 50 {
+                    &self.diffs_history[self.diffs_history.len() - 50..]
+                } else {
+                    &self.diffs_history[..]
+                };
+
+                let points: Vec<egui::Pos2> = history_slice
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &val)| {
+                        let x = rect.left()
+                            + pad_left
+                            + (draw_w / (history_slice.len() - 1) as f32) * idx as f32;
+                        let y = rect.bottom()
+                            - pad_bottom
+                            - (draw_h * ((val * 100.0) / max_y_pct) as f32);
+                        egui::pos2(x, y)
+                    })
+                    .collect();
+
+                for i in 0..points.len() - 1 {
+                    painter.line_segment(
+                        [points[i], points[i + 1]],
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 110, 240)),
+                    );
+                }
+            } else {
+                painter.text(
+                    egui::pos2(rect.center().x, rect.center().y),
+                    egui::Align2::CENTER_CENTER,
+                    "Väntar på skärmklippsdata...",
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::GRAY,
+                );
+            }
+
+            ui.add_space(10.0);
+
+            // Dela upp botten i två kolumner: Loggar till vänster, Förhandsgranskning till höger
+            ui.columns(2, |cols| {
+                // Vänster kolumn: Loggar
+                cols[0].vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Händelselogg:");
+                        if ui.button("Rensa logg").clicked() {
+                            self.logs.clear();
+                            self.diffs_history.clear();
+                            self.total_captures = 0;
+                            self.total_changes = 0;
+                        }
+                    });
+
+                    let log_table_height = ui.available_height() - 10.0;
+                    egui::ScrollArea::vertical()
+                        .max_height(log_table_height)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            egui::Grid::new("log_grid")
+                                .striped(true)
+                                .num_columns(4)
+                                .spacing([10.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Tid");
+                                    ui.label("Diff %");
+                                    ui.label("OCR-text");
+                                    ui.label("Status");
+                                    ui.end_row();
+
+                                    for log in self.logs.iter().rev() {
+                                        ui.label(&log.timestamp);
+                                        ui.label(format!("{:.2}%", log.pixel_diff * 100.0));
+
+                                        // Begränsa OCR-textens längd i tabellen
+                                        let short_ocr = if log.ocr_text.chars().count() > 25 {
+                                            format!(
+                                                "{}...",
+                                                log.ocr_text.chars().take(25).collect::<String>()
+                                            )
+                                        } else {
+                                            log.ocr_text.clone()
+                                        };
+                                        ui.label(short_ocr).on_hover_text(&log.ocr_text);
+
+                                        if log.is_changed {
+                                            ui.colored_label(egui::Color32::GREEN, "Ändrad");
+                                        } else {
+                                            ui.label("Ingen ändring");
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+
+                // Höger kolumn: Senaste bild
+                cols[1].vertical(|ui| {
+                    ui.label("Senaste skärmklipp:");
+                    if let Some(ref texture) = self.preview_texture {
+                        if let Some(size) = self.preview_size {
+                            // Skala bilden så att den passar inom kolumnbredden
+                            let available_w = ui.available_width();
+                            let aspect_ratio = size[0] as f32 / size[1] as f32;
+                            let draw_w = available_w;
+                            let draw_h = draw_w / aspect_ratio;
+
+                            ui.image((texture.id(), egui::vec2(draw_w, draw_h)));
+                        }
+                    } else {
+                        // Visa en tom platshållare
+                        let h = ui.available_height() - 10.0;
+                        let (rect, _response) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), h),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(rect);
+                        painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(20));
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Ingen bild att visa",
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::GRAY,
+                        );
+                    }
+                });
+            });
+        });
+    }
+}
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("ASC - Skärmklipp & Analys")
+            .with_inner_size([1024.0, 768.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "asc-screen-analyzer",
+        options,
+        Box::new(|_cc| Ok(Box::new(AscApp::default()))),
+    )
+}

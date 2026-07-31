@@ -1,7 +1,35 @@
-# Tauri + Vanilla
+# ASC – Skärmklipp & Analys
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Javascript.
+ASC är en plattformsoberoende skrivbordsapp för att övervaka skärmar eller fönster, spara skärmklipp och analysera visuella eller textbaserade förändringar. Gränssnittet är byggt direkt i Rust med `eframe`/`egui`; Tauri, Node.js och webbfrontend behövs inte längre.
 
-## Recommended IDE Setup
+## Funktioner
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+- Liveövervakning av skärm eller enskilt fönster
+- Valfri beskärning av skärmklipp och OCR-område
+- Förändringsanalys med justerbar pixeltröskel
+- Inbyggd OCR på macOS och Windows
+- Efterhandsanalys av PNG- och JPEG-bilder i en mapp
+- Förhandsgranskning, statistik, graf och händelselogg
+
+## Utveckling
+
+Installera en stabil Rust-verktygskedja och kör:
+
+```sh
+cargo run
+```
+
+Kontroller som ska passera före en release:
+
+```sh
+cargo fmt -- --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+```
+
+På macOS måste appen få behörighet för skärminspelning i Systeminställningar. OCR-hjälpprogrammet i `resources/` bäddas in i appbinären. Windows-hjälpprogrammet byggs automatiskt i GitHub Actions före Rust-bygget.
+
+## Release
+
+Workflowen i `.github/workflows/release.yml` bygger fristående binärer för macOS och Windows när en tagg som börjar med `v` pushas. Den kan även startas manuellt från GitHub Actions.
