@@ -2,10 +2,12 @@
 
 mod analysis;
 mod capture;
+mod mouse_sim;
 mod ocr;
 
 use chrono::Local;
 use eframe::egui;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -33,6 +35,8 @@ enum WorkerMessage {
 }
 
 struct AscApp {
+    active_tab: String,
+
     // Gränssnittsinställningar
     mode: String,        // "live" eller "offline"
     source_type: String, // "window" eller "screen"
@@ -80,11 +84,31 @@ struct AscApp {
     log_receiver: Option<Receiver<WorkerMessage>>,
     control_sender: Option<Sender<ControlMessage>>,
     folder_receiver: Option<Receiver<Option<String>>>,
+
+    // Musautomatisering
+    mouse_running: bool,
+    mouse_status: String,
+    mouse_last_activity: String,
+    mouse_moves: u64,
+    mouse_clicks: u64,
+    mouse_interval_min: u64,
+    mouse_interval_max: u64,
+    mouse_pause_chance: f64,
+    mouse_pause_min: u64,
+    mouse_pause_max: u64,
+    mouse_click_enabled: bool,
+    mouse_click_every: u32,
+    mouse_selected_windows: HashSet<u32>,
+    mouse_stop_after_enabled: bool,
+    mouse_stop_after_minutes: u64,
+    mouse_receiver: Option<Receiver<mouse_sim::Event>>,
+    mouse_control_sender: Option<Sender<()>>,
 }
 
 impl Default for AscApp {
     fn default() -> Self {
         let mut app = Self {
+            active_tab: "analysis".to_string(),
             mode: "live".to_string(),
             source_type: "screen".to_string(),
             selected_source_id: 0,
@@ -123,6 +147,23 @@ impl Default for AscApp {
             log_receiver: None,
             control_sender: None,
             folder_receiver: None,
+            mouse_running: false,
+            mouse_status: "Klar att starta".to_string(),
+            mouse_last_activity: "Ingen aktivitet ännu.".to_string(),
+            mouse_moves: 0,
+            mouse_clicks: 0,
+            mouse_interval_min: 5,
+            mouse_interval_max: 15,
+            mouse_pause_chance: 20.0,
+            mouse_pause_min: 10,
+            mouse_pause_max: 30,
+            mouse_click_enabled: false,
+            mouse_click_every: 3,
+            mouse_selected_windows: HashSet::new(),
+            mouse_stop_after_enabled: true,
+            mouse_stop_after_minutes: 60,
+            mouse_receiver: None,
+            mouse_control_sender: None,
         };
         app.refresh_sources();
         app
@@ -510,6 +551,225 @@ impl AscApp {
 }
 
 impl AscApp {
+    fn refresh_mouse_windows(&mut self) {
+        self.refresh_sources();
+        let available = self
+            .windows
+            .iter()
+            .map(|window| window.id)
+            .collect::<HashSet<_>>();
+        self.mouse_selected_windows
+            .retain(|window_id| available.contains(window_id));
+    }
+
+    fn start_mouse_simulation(&mut self, ctx: &egui::Context) {
+        if self.mouse_click_enabled && self.mouse_selected_windows.is_empty() {
+            self.mouse_status = "Välj minst ett tillåtet fönster eller stäng av klick.".to_string();
+            return;
+        }
+
+        let config = mouse_sim::Config {
+            interval_min: Duration::from_secs(self.mouse_interval_min.min(self.mouse_interval_max)),
+            interval_max: Duration::from_secs(self.mouse_interval_min.max(self.mouse_interval_max)),
+            pause_chance: self.mouse_pause_chance / 100.0,
+            pause_min: Duration::from_secs(self.mouse_pause_min.min(self.mouse_pause_max)),
+            pause_max: Duration::from_secs(self.mouse_pause_min.max(self.mouse_pause_max)),
+            click_enabled: self.mouse_click_enabled,
+            click_every: self.mouse_click_every.max(1),
+            window_ids: self.mouse_selected_windows.iter().copied().collect(),
+            stop_after: self
+                .mouse_stop_after_enabled
+                .then(|| Duration::from_secs(self.mouse_stop_after_minutes.max(1) * 60)),
+        };
+        let (event_tx, event_rx) = channel();
+        let (control_tx, control_rx) = channel();
+        self.mouse_receiver = Some(event_rx);
+        self.mouse_control_sender = Some(control_tx);
+        self.mouse_running = true;
+        self.mouse_moves = 0;
+        self.mouse_clicks = 0;
+        self.mouse_last_activity = "Väntar på första rörelsen…".to_string();
+        self.mouse_status = "Musautomatisering körs.".to_string();
+        std::thread::spawn(move || mouse_sim::run(config, control_rx, event_tx));
+        ctx.request_repaint();
+    }
+
+    fn stop_mouse_simulation(&mut self) {
+        if let Some(sender) = self.mouse_control_sender.as_ref() {
+            let _ = sender.send(());
+        }
+        self.mouse_status = "Stoppar…".to_string();
+    }
+
+    fn show_mouse_tab(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Muspekar-simulering");
+            ui.label(
+                "Gör mjuka, slumpmässiga musrörelser. Analysen kan fortsätta samtidigt i den andra fliken.",
+            );
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Status:");
+                ui.colored_label(
+                    if self.mouse_running {
+                        egui::Color32::GREEN
+                    } else {
+                        egui::Color32::LIGHT_GRAY
+                    },
+                    &self.mouse_status,
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(format!("Rörelser: {}", self.mouse_moves));
+                ui.separator();
+                ui.label(format!("Klick: {}", self.mouse_clicks));
+            });
+            ui.small(format!("Senast: {}", self.mouse_last_activity));
+            ui.separator();
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_enabled_ui(!self.mouse_running, |ui| {
+                    ui.heading("Tidsinställningar");
+                    egui::Grid::new("mouse_timing_grid")
+                        .num_columns(3)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Intervall mellan rörelser:");
+                            ui.add(
+                                egui::DragValue::new(&mut self.mouse_interval_min)
+                                    .range(1..=3_600)
+                                    .suffix(" sek min"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.mouse_interval_max)
+                                    .range(1..=3_600)
+                                    .suffix(" sek max"),
+                            );
+                            ui.end_row();
+                            ui.label("Slumpmässig paus:");
+                            ui.add(
+                                egui::Slider::new(&mut self.mouse_pause_chance, 0.0..=100.0)
+                                    .suffix(" % chans"),
+                            );
+                            ui.label("");
+                            ui.end_row();
+                            ui.label("Pauslängd:");
+                            ui.add(
+                                egui::DragValue::new(&mut self.mouse_pause_min)
+                                    .range(1..=3_600)
+                                    .suffix(" sek min"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.mouse_pause_max)
+                                    .range(1..=3_600)
+                                    .suffix(" sek max"),
+                            );
+                            ui.end_row();
+                        });
+
+                    ui.add_space(12.0);
+                    ui.heading("Fönsterklick");
+                    ui.checkbox(
+                        &mut self.mouse_click_enabled,
+                        "Klicka på titelraden i särskilt valda fönster",
+                    );
+                    ui.small(
+                        "Klick är avstängt som standard. ASC klickar aldrig i ett omarkerat fönster.",
+                    );
+                    if self.mouse_click_enabled {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Klicka var");
+                            ui.add(
+                                egui::DragValue::new(&mut self.mouse_click_every)
+                                    .range(1..=100)
+                                    .suffix(":e rörelse"),
+                            );
+                            if ui.button("Uppdatera fönster").clicked() {
+                                self.refresh_mouse_windows();
+                            }
+                            if ui.button("Markera alla").clicked() {
+                                self.mouse_selected_windows
+                                    .extend(self.windows.iter().map(|window| window.id));
+                            }
+                            if ui.button("Avmarkera alla").clicked() {
+                                self.mouse_selected_windows.clear();
+                            }
+                        });
+                        egui::ScrollArea::vertical()
+                            .id_source("mouse_window_list")
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                if self.windows.is_empty() {
+                                    ui.weak(
+                                        "Inga öppna fönster hittades. Tryck Uppdatera fönster.",
+                                    );
+                                }
+                                for window in &self.windows {
+                                    let mut selected =
+                                        self.mouse_selected_windows.contains(&window.id);
+                                    if ui
+                                        .checkbox(
+                                            &mut selected,
+                                            format!("{} — {}", window.app_name, window.title),
+                                        )
+                                        .changed()
+                                    {
+                                        if selected {
+                                            self.mouse_selected_windows.insert(window.id);
+                                        } else {
+                                            self.mouse_selected_windows.remove(&window.id);
+                                        }
+                                    }
+                                }
+                            });
+                    }
+
+                    ui.add_space(12.0);
+                    ui.heading("Säkerhet");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.mouse_stop_after_enabled,
+                            "Stoppa automatiskt efter",
+                        );
+                        ui.add_enabled(
+                            self.mouse_stop_after_enabled,
+                            egui::DragValue::new(&mut self.mouse_stop_after_minutes)
+                                .range(1..=480)
+                                .suffix(" minuter"),
+                        );
+                    });
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Nödstopp: flytta muspekaren till skärmens övre vänstra hörn.",
+                    );
+                });
+
+                ui.add_space(16.0);
+                if self.mouse_running {
+                    if ui
+                        .add_sized(
+                            [230.0, 42.0],
+                            egui::Button::new("Stoppa musautomatisering")
+                                .fill(egui::Color32::from_rgb(180, 60, 60)),
+                        )
+                        .clicked()
+                    {
+                        self.stop_mouse_simulation();
+                    }
+                } else if ui
+                    .add_sized(
+                        [230.0, 42.0],
+                        egui::Button::new("Starta musautomatisering")
+                            .fill(egui::Color32::from_rgb(60, 160, 60)),
+                    )
+                    .clicked()
+                {
+                    self.start_mouse_simulation(ctx);
+                }
+            });
+        });
+    }
+
     fn display_preview_image(
         &mut self,
         image: image::DynamicImage,
@@ -812,6 +1072,34 @@ impl eframe::App for AscApp {
             }
         }
 
+        let mut mouse_stopped = None;
+        if let Some(receiver) = self.mouse_receiver.as_ref() {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    mouse_sim::Event::Activity {
+                        description,
+                        moves,
+                        clicks,
+                    } => {
+                        self.mouse_last_activity = description;
+                        self.mouse_moves = moves;
+                        self.mouse_clicks = clicks;
+                        self.mouse_status = "Musautomatisering körs.".to_string();
+                    }
+                    mouse_sim::Event::Status(status) => self.mouse_status = status,
+                    mouse_sim::Event::Stopped(reason) => mouse_stopped = Some(reason),
+                }
+            }
+        }
+        if let Some(reason) = mouse_stopped {
+            self.mouse_running = false;
+            self.mouse_status = reason;
+            self.mouse_receiver = None;
+            self.mouse_control_sender = None;
+        } else if self.mouse_running {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
         // Kontrollera om vi tagit emot meddelanden från bakgrundstråden
         let mut should_clear_receiver = false;
         let mut analysis_changed = false;
@@ -871,6 +1159,33 @@ impl eframe::App for AscApp {
             self.last_export_at = Instant::now();
         } else if self.export_pending {
             ctx.request_repaint_after(export_interval - export_elapsed);
+        }
+
+        egui::TopBottomPanel::top("main_tabs").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    "analysis".to_string(),
+                    if self.is_running {
+                        "Skärmklipp & analys • körs"
+                    } else {
+                        "Skärmklipp & analys"
+                    },
+                );
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    "mouse".to_string(),
+                    if self.mouse_running {
+                        "Muspekar-simulering • körs"
+                    } else {
+                        "Muspekar-simulering"
+                    },
+                );
+            });
+        });
+        if self.active_tab == "mouse" {
+            self.show_mouse_tab(ctx);
+            return;
         }
 
         // Definiera det övergripande gränssnittet

@@ -15,6 +15,9 @@ ASC är en plattformsoberoende skrivbordsapp för att övervaka skärmar eller f
 - Virtualiserad händelselogg som förblir snabb även vid långa analyser
 - Klickbara loggrader för att växla mellan sparade skärmklipp
 - Icke-blockerande mappväljare som låter appen fortsätta svara
+- Separat flik för mjuka, slumpmässiga musrörelser med intervall och pauser
+- Valfria titelradsklick som begränsas till särskilt markerade fönster
+- Oberoende start/stopp så analys och musautomatisering kan köras samtidigt
 - Automatisk export till `asc-analysis.csv` och `asc-analysis.json`
 
 ## Utveckling
@@ -37,6 +40,8 @@ cargo build --release
 På macOS måste appen få behörighet för skärminspelning i Systeminställningar. OCR-hjälpprogrammet i `resources/` bäddas in i appbinären. Windows-hjälpprogrammet byggs automatiskt i GitHub Actions före Rust-bygget.
 
 Den första bilden används som referens. Från och med bild två markeras en förändring när RGB-skillnaden når pixeltröskeln eller när OCR-texten ändras. Analysfilerna uppdateras automatiskt i den valda mappen.
+
+Musautomatiseringen har ett separat start/stopp och kan därför köras samtidigt med analysen. Fönsterklick är avstängt som standard och begränsas till de fönster som användaren uttryckligen markerar. Flytta pekaren till huvudskärmens övre vänstra hörn för nödstopp. På macOS behöver ASC även behörighet under Integritet och säkerhet > Hjälpmedel för att styra muspekaren.
 
 ## Release
 
