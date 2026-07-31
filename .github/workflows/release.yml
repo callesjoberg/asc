@@ -16,7 +16,7 @@ jobs:
           - platform: 'macos-latest'
             build-cmd: 'clang -O3 -framework Foundation -framework AppKit -framework Vision src-ocr/macos/ocr-helper.m -o src-tauri/resources/ocr-helper-macos'
           - platform: 'windows-latest'
-            build-cmd: 'dotnet build -c Release src-ocr/windows/OcrHelper.csproj -o src-tauri/resources/ && copy src-tauri/resources\OcrHelper.exe src-tauri/resources\ocr-helper-win.exe'
+            build-cmd: 'dotnet build -c Release src-ocr/windows/OcrHelper.csproj -o src-tauri/resources/ && cp src-tauri/resources/OcrHelper.exe src-tauri/resources/ocr-helper-win.exe'
     
     runs-on: ${{ matrix.platform }}
     steps:
