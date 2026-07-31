@@ -45,6 +45,49 @@ pub struct Config {
     pub ocr_area: Option<(u32, u32, u32, u32)>,
     pub color_area: Option<(u32, u32, u32, u32)>,
     pub interval: Duration,
+    pub confirmation_samples: u32,
+}
+
+struct StatusDebouncer {
+    confirmed: PresenceStatus,
+    candidate: PresenceStatus,
+    candidate_count: u32,
+    required: u32,
+}
+
+impl StatusDebouncer {
+    fn new(required: u32) -> Self {
+        Self {
+            confirmed: PresenceStatus::Unknown,
+            candidate: PresenceStatus::Unknown,
+            candidate_count: 0,
+            required: required.max(1),
+        }
+    }
+
+    fn update(&mut self, observed: PresenceStatus) -> PresenceStatus {
+        if observed == PresenceStatus::Unknown && self.confirmed != PresenceStatus::Unknown {
+            self.candidate = PresenceStatus::Unknown;
+            self.candidate_count = 0;
+            return self.confirmed;
+        }
+        if observed == self.confirmed {
+            self.candidate = observed;
+            self.candidate_count = 0;
+            return self.confirmed;
+        }
+        if observed == self.candidate {
+            self.candidate_count = self.candidate_count.saturating_add(1);
+        } else {
+            self.candidate = observed;
+            self.candidate_count = 1;
+        }
+        if self.candidate_count >= self.required {
+            self.confirmed = observed;
+            self.candidate_count = 0;
+        }
+        self.confirmed
+    }
 }
 
 pub enum Event {
@@ -57,6 +100,7 @@ pub enum Event {
 }
 
 pub fn run(config: Config, control: Receiver<()>, events: Sender<Event>) {
+    let mut debouncer = StatusDebouncer::new(config.confirmation_samples);
     loop {
         match control.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => {
@@ -86,6 +130,7 @@ pub fn run(config: Config, control: Receiver<()>, events: Sender<Event>) {
                                 let _ = events.send(Event::Error(error));
                             }
                         }
+                        let _ = std::fs::remove_file(&temp_path);
                     }
                 }
 
@@ -97,13 +142,14 @@ pub fn run(config: Config, control: Receiver<()>, events: Sender<Event>) {
                     .flatten();
                 // Den visuellt markerade statusbollen är redan knuten till rätt rad.
                 // Låt därför färgbytet fungera även om OCR stavar personnamnet fel.
-                let status = text_status
+                let observed_status = text_status
                     .or_else(|| {
                         config
                             .color_area
                             .map(|area| status_from_color(&image, area))
                     })
                     .unwrap_or(PresenceStatus::Unknown);
+                let status = debouncer.update(observed_status);
                 let _ = events.send(Event::Sample { status, ocr_text });
             }
             Err(error) => {
@@ -310,5 +356,27 @@ mod tests {
             status_from_color(&DynamicImage::ImageRgb8(image), (0, 0, 8, 8)),
             PresenceStatus::Unknown
         );
+    }
+
+    #[test]
+    fn status_changes_require_confirmation_and_ignore_single_unknown_sample() {
+        let mut debouncer = StatusDebouncer::new(2);
+        assert_eq!(
+            debouncer.update(PresenceStatus::Available),
+            PresenceStatus::Unknown
+        );
+        assert_eq!(
+            debouncer.update(PresenceStatus::Available),
+            PresenceStatus::Available
+        );
+        assert_eq!(
+            debouncer.update(PresenceStatus::Unknown),
+            PresenceStatus::Available
+        );
+        assert_eq!(
+            debouncer.update(PresenceStatus::Busy),
+            PresenceStatus::Available
+        );
+        assert_eq!(debouncer.update(PresenceStatus::Busy), PresenceStatus::Busy);
     }
 }

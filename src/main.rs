@@ -103,6 +103,19 @@ struct RegionInteraction {
     resize: Option<ResizeCorner>,
 }
 
+#[derive(Clone)]
+struct VisualRegionBackup {
+    enable_crop: bool,
+    crop: (u32, u32, u32, u32),
+    enable_ocr: bool,
+    ocr_regions: Vec<(u32, u32, u32, u32)>,
+    measurement_regions: Vec<(u32, u32, u32, u32)>,
+    indicator: (u32, u32, u32, u32),
+    source_type: String,
+    source_id: Option<u32>,
+    source_size: Option<[usize; 2]>,
+}
+
 impl AutomationStepEditor {
     fn basic(kind: &str, value: &str) -> Self {
         Self {
@@ -337,6 +350,7 @@ struct AscApp {
     presence_receiver: Option<Receiver<presence::Event>>,
     presence_control_sender: Option<Sender<()>>,
     presence_region_setup_pending: bool,
+    presence_region_backup: Option<VisualRegionBackup>,
 }
 
 impl Default for AscApp {
@@ -465,11 +479,17 @@ impl Default for AscApp {
             presence_receiver: None,
             presence_control_sender: None,
             presence_region_setup_pending: false,
+            presence_region_backup: None,
         };
         app.refresh_sources();
         app.automation_window_id = app.windows.first().map(|window| window.id).unwrap_or(0);
         app.mouse_typing_window_id = app.windows.first().map(|window| window.id).unwrap_or(0);
-        app.presence_window_id = app.windows.first().map(|window| window.id).unwrap_or(0);
+        app.presence_window_id = app
+            .windows
+            .iter()
+            .find(|window| is_teams_window(window))
+            .map(|window| window.id)
+            .unwrap_or(0);
         app
     }
 }
@@ -545,6 +565,122 @@ impl AscApp {
         self.region_source_type.clear();
         self.region_source_id = None;
         self.region_source_size = None;
+    }
+
+    fn visual_region_backup(&self) -> VisualRegionBackup {
+        VisualRegionBackup {
+            enable_crop: self.enable_crop,
+            crop: (self.crop_x, self.crop_y, self.crop_w, self.crop_h),
+            enable_ocr: self.enable_ocr,
+            ocr_regions: self.ocr_regions.clone(),
+            measurement_regions: self.measurement_regions.clone(),
+            indicator: (
+                self.indicator_x,
+                self.indicator_y,
+                self.indicator_w,
+                self.indicator_h,
+            ),
+            source_type: self.region_source_type.clone(),
+            source_id: self.region_source_id,
+            source_size: self.region_source_size,
+        }
+    }
+
+    fn restore_visual_region_backup(&mut self) {
+        let Some(backup) = self.presence_region_backup.take() else {
+            return;
+        };
+        self.enable_crop = backup.enable_crop;
+        (self.crop_x, self.crop_y, self.crop_w, self.crop_h) = backup.crop;
+        self.enable_ocr = backup.enable_ocr;
+        self.ocr_regions = backup.ocr_regions;
+        self.measurement_regions = backup.measurement_regions;
+        (
+            self.indicator_x,
+            self.indicator_y,
+            self.indicator_w,
+            self.indicator_h,
+        ) = backup.indicator;
+        self.region_source_type = backup.source_type;
+        self.region_source_id = backup.source_id;
+        self.region_source_size = backup.source_size;
+        self.region_source_image = None;
+        self.region_editor_active = false;
+        self.region_result_preview = false;
+        self.region_drag_start = None;
+        self.region_selected = None;
+        self.region_interaction = None;
+    }
+
+    fn begin_presence_region_setup(&mut self, ctx: &egui::Context) {
+        if !self
+            .windows
+            .iter()
+            .any(|window| window.id == self.presence_window_id)
+        {
+            self.presence_status_text = "Välj ett tillgängligt Teams-fönster först.".to_string();
+            return;
+        }
+        self.presence_region_backup = Some(self.visual_region_backup());
+        self.clear_visual_regions();
+        self.mode = "live".to_string();
+        self.source_type = "window".to_string();
+        self.selected_source_id = self.presence_window_id;
+        self.presence_region_setup_pending = true;
+        self.active_tab = "analysis".to_string();
+        self.start_region_editor(ctx);
+        if self.region_editor_active {
+            self.status_text = "Markera personraden som OCR och statusbollen som Pixel/färg. Välj sedan OK och Använd för Teams-status.".to_string();
+        } else {
+            self.presence_region_setup_pending = false;
+            self.restore_visual_region_backup();
+        }
+    }
+
+    fn finish_presence_region_setup(&mut self) -> Result<(), String> {
+        if self.region_source_type != "window"
+            || self.region_source_id != Some(self.presence_window_id)
+        {
+            return Err("Markeringarna kommer inte från det valda Teams-fönstret.".to_string());
+        }
+        let ocr_area = self.ocr_regions.first().copied();
+        let color_area = self.measurement_regions.first().copied();
+        if ocr_area.is_none() && color_area.is_none() {
+            return Err("Markera minst personraden eller statusbollen först.".to_string());
+        }
+        self.presence_ocr_area = ocr_area;
+        self.presence_color_area = color_area;
+        self.presence_region_setup_pending = false;
+        self.restore_visual_region_backup();
+        self.active_tab = "presence".to_string();
+        self.presence_status_text = format!(
+            "Teams-områden klara: OCR {}, statusboll {}.",
+            if self.presence_ocr_area.is_some() {
+                "ja"
+            } else {
+                "nej"
+            },
+            if self.presence_color_area.is_some() {
+                "ja"
+            } else {
+                "nej"
+            }
+        );
+        Ok(())
+    }
+
+    fn cancel_region_setup(&mut self) {
+        if self.presence_region_setup_pending {
+            self.presence_region_setup_pending = false;
+            self.restore_visual_region_backup();
+            self.active_tab = "presence".to_string();
+            self.presence_status_text = "Teams-markeringen avbröts.".to_string();
+        } else {
+            self.region_editor_active = false;
+            self.region_result_preview = false;
+            self.region_source_image = None;
+            self.status_text = "Områdesväljaren stängdes.".to_string();
+        }
     }
 
     fn has_visual_regions(&self) -> bool {
@@ -1238,7 +1374,12 @@ impl AscApp {
             self.mouse_typing_window_id = self.windows.first().map(|window| window.id).unwrap_or(0);
         }
         if !available.contains(&self.presence_window_id) {
-            self.presence_window_id = self.windows.first().map(|window| window.id).unwrap_or(0);
+            self.presence_window_id = self
+                .windows
+                .iter()
+                .find(|window| is_teams_window(window))
+                .map(|window| window.id)
+                .unwrap_or(0);
         }
     }
 
@@ -1347,7 +1488,7 @@ impl AscApp {
 
     fn import_macro_recording(&mut self, recording: macro_recorder::MacroRecording) {
         let mut steps = Vec::new();
-        let mut previous_at = 0_u64;
+        let mut previous_at = None;
         let mut active_window = None;
         let mut first_window = None;
         let mut skipped = 0_usize;
@@ -1358,8 +1499,10 @@ impl AscApp {
                 continue;
             };
             first_window.get_or_insert(window_id);
-            let delay_ms = event.after_ms.saturating_sub(previous_at).min(600_000);
-            previous_at = event.after_ms;
+            let delay_ms = previous_at
+                .map(|previous| event.after_ms.saturating_sub(previous).min(600_000))
+                .unwrap_or(0);
+            previous_at = Some(event.after_ms);
             if delay_ms >= 50 {
                 steps.push(AutomationStepEditor::recorded_wait(delay_ms));
             }
@@ -1446,9 +1589,12 @@ impl AscApp {
                             format!("Steg {} saknar ett tillgängligt målfönster.", index + 1);
                         return;
                     };
-                    if !step.value.trim().is_empty() && window.title != step.value {
+                    if !self.automation_dry_run
+                        && !step.value.trim().is_empty()
+                        && window.title != step.value
+                    {
                         self.automation_status = format!(
-                            "Steg {} stoppades: fönstertiteln har ändrats från ‘{}’ till ‘{}’.",
+                            "Steg {} stoppades: fönstertiteln har ändrats från ‘{}’ till ‘{}’. Godkänn aktuell titel i steget före riktig körning.",
                             index + 1,
                             step.value,
                             window.title
@@ -1595,6 +1741,7 @@ impl AscApp {
             ocr_area: self.presence_ocr_area,
             color_area: self.presence_color_area,
             interval: Duration::from_secs(self.presence_interval_secs.max(1)),
+            confirmation_samples: 2,
         };
         let (event_tx, event_rx) = channel();
         let (control_tx, control_rx) = channel();
@@ -1614,14 +1761,6 @@ impl AscApp {
     }
 
     fn show_presence_tab(&mut self, ctx: &egui::Context) {
-        if self.presence_region_setup_pending
-            && (!self.ocr_regions.is_empty() || !self.measurement_regions.is_empty())
-        {
-            self.presence_ocr_area = self.ocr_regions.first().copied();
-            self.presence_color_area = self.measurement_regions.first().copied();
-            self.presence_region_setup_pending = false;
-            self.presence_status_text = "De visuella Teams-områdena har hämtats.".to_string();
-        }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Teams-status");
             ui.label(
@@ -1659,7 +1798,11 @@ impl AscApp {
                                     .unwrap_or_else(|| "Välj fönster…".to_string()),
                             )
                             .show_ui(ui, |ui| {
-                                for window in &self.windows {
+                                for window in self
+                                    .windows
+                                    .iter()
+                                    .filter(|window| is_teams_window(window))
+                                {
                                     ui.selectable_value(
                                         &mut self.presence_window_id,
                                         window.id,
@@ -1667,6 +1810,12 @@ impl AscApp {
                                     );
                                 }
                             });
+                        if !self.windows.iter().any(is_teams_window) {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                "Inget synligt Teams-fönster hittades. Öppna Teams och välj Uppdatera.",
+                            );
+                        }
                         if ui.button("Uppdatera").clicked() {
                             self.refresh_mouse_windows();
                         }
@@ -1685,22 +1834,22 @@ impl AscApp {
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Markera områden visuellt…").clicked() {
-                            self.mode = "live".to_string();
-                            self.source_type = "window".to_string();
-                            self.selected_source_id = self.presence_window_id;
-                            self.presence_region_setup_pending = true;
-                            self.active_tab = "analysis".to_string();
-                            self.start_region_editor(ctx);
-                            self.status_text = "Markera personraden som OCR och statusbollen som Pixel/färg. När resultatet är klart går du tillbaka till Teams-status; områdena hämtas automatiskt.".to_string();
+                            self.begin_presence_region_setup(ctx);
                         }
                         if ui.button("Hämta markeringarna").clicked() {
-                            self.presence_ocr_area = self.ocr_regions.first().copied();
-                            self.presence_color_area = self.measurement_regions.first().copied();
-                            self.presence_status_text = format!(
-                                "Områden hämtade: OCR {}, statusboll {}.",
-                                if self.presence_ocr_area.is_some() { "ja" } else { "nej" },
-                                if self.presence_color_area.is_some() { "ja" } else { "nej" }
-                            );
+                            if self.region_source_type == "window"
+                                && self.region_source_id == Some(self.presence_window_id)
+                            {
+                                self.presence_ocr_area = self.ocr_regions.first().copied();
+                                self.presence_color_area = self.measurement_regions.first().copied();
+                                self.presence_status_text = format!(
+                                    "Områden hämtade: OCR {}, statusboll {}.",
+                                    if self.presence_ocr_area.is_some() { "ja" } else { "nej" },
+                                    if self.presence_color_area.is_some() { "ja" } else { "nej" }
+                                );
+                            } else {
+                                self.presence_status_text = "De befintliga markeringarna kommer inte från valt Teams-fönster. Välj Markera områden visuellt.".to_string();
+                            }
                         }
                     });
                     ui.small(
@@ -2913,6 +3062,7 @@ impl AscApp {
     }
 
     fn start_region_editor(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         let result = if self.mode == "live" {
             capture::capture_source(&self.source_type, self.selected_source_id, None)
         } else {
@@ -3129,6 +3279,23 @@ impl AscApp {
         let mut show_result = false;
         let mut return_to_editor = false;
         let mut accept_result = false;
+        let mut cancel_editor = false;
+        if self.region_editor_active || self.region_result_preview {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading(if self.presence_region_setup_pending {
+                    "Markera Teams-områden"
+                } else {
+                    "Välj analysområden"
+                });
+                if ui.button("Maximera fönstret").clicked() {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                }
+                if ui.button("Avbryt områdesväljaren").clicked() {
+                    cancel_editor = true;
+                }
+            });
+        }
         ui.horizontal_wrapped(|ui| {
             let title = self
                 .selected_preview_file
@@ -3165,7 +3332,7 @@ impl AscApp {
             )
             .on_hover_text("Zoom relativt Anpassa-läget");
             if self.region_editor_active {
-                ui.label("Rulla för zoom · dra för att markera · dubbelklicka för Anpassa");
+                ui.label("Rulla för zoom · vänsterdra för markering · högerdra för panorering · dubbelklicka för Anpassa");
             } else {
                 ui.label("Rulla för zoom · dra för panorering · dubbelklicka för Anpassa");
             }
@@ -3176,7 +3343,12 @@ impl AscApp {
                 if ui.button("← Tillbaka och ändra").clicked() {
                     return_to_editor = true;
                 }
-                if ui.button("Använd resultatet").clicked() {
+                let apply_label = if self.presence_region_setup_pending {
+                    "Använd för Teams-status"
+                } else {
+                    "Använd resultatet"
+                };
+                if ui.button(apply_label).clicked() {
                     accept_result = true;
                 }
             });
@@ -3228,19 +3400,30 @@ impl AscApp {
                 "Dra på tom yta för att skapa. Dra inuti en vald ram för att flytta; dra ett hörnhandtag för att ändra storlek.",
             );
         }
-        if show_result {
+        if cancel_editor {
+            self.cancel_region_setup();
+            return;
+        } else if show_result {
             let ctx = ui.ctx().clone();
             self.show_region_result(&ctx);
         } else if return_to_editor {
             let ctx = ui.ctx().clone();
             self.return_to_region_editor(&ctx);
         } else if accept_result {
-            self.region_result_preview = false;
-            self.status_text = format!(
-                "Områden används: {} OCR, {} pixel/färg.",
-                self.ocr_regions.len(),
-                self.measurement_regions.len()
-            );
+            if self.presence_region_setup_pending {
+                if let Err(error) = self.finish_presence_region_setup() {
+                    self.status_text = error;
+                    return;
+                }
+                return;
+            } else {
+                self.region_result_preview = false;
+                self.status_text = format!(
+                    "Områden används: {} OCR, {} pixel/färg.",
+                    self.ocr_regions.len(),
+                    self.measurement_regions.len()
+                );
+            }
         }
         ui.separator();
 
@@ -3276,7 +3459,11 @@ impl AscApp {
                 self.preview_zoom = (self.preview_zoom * (scroll * 0.0015).exp()).clamp(0.1, 8.0);
             }
         }
-        if !self.region_editor_active && response.dragged_by(egui::PointerButton::Primary) {
+        if (!self.region_editor_active && response.dragged_by(egui::PointerButton::Primary))
+            || (self.region_editor_active
+                && (response.dragged_by(egui::PointerButton::Secondary)
+                    || response.dragged_by(egui::PointerButton::Middle)))
+        {
             self.preview_pan += ui.input(|input| input.pointer.delta());
         }
 
@@ -3691,7 +3878,11 @@ impl eframe::App for AscApp {
                 match event {
                     mouse_sim::Event::Activity { description, .. } => {
                         self.automation_last_activity = description;
-                        self.automation_status = "OCR-klicksekvensen körs.".to_string();
+                        self.automation_status = if self.automation_dry_run {
+                            "Torrkörning av RPA-sekvensen pågår.".to_string()
+                        } else {
+                            "RPA-sekvensen körs.".to_string()
+                        };
                     }
                     mouse_sim::Event::Status(status) => self.automation_status = status,
                     mouse_sim::Event::Stopped(reason) => automation_stopped = Some(reason),
@@ -3714,6 +3905,13 @@ impl eframe::App for AscApp {
                 match event {
                     presence::Event::Sample { status, ocr_text } => {
                         self.presence_last_ocr = ocr_text;
+                        if status == presence::PresenceStatus::Unknown
+                            && self.presence_current_status.is_none()
+                        {
+                            self.presence_status_text =
+                                "Väntar på två samstämmiga statusavläsningar…".to_string();
+                            continue;
+                        }
                         if self.presence_current_status != Some(status) {
                             let now = Local::now();
                             if let Some(started) = self.presence_current_started.take() {
@@ -3874,6 +4072,10 @@ impl eframe::App for AscApp {
                 );
             });
         });
+        if self.region_editor_active || self.region_result_preview {
+            egui::CentralPanel::default().show(ctx, |ui| self.show_preview_panel(ui));
+            return;
+        }
         if self.active_tab == "mouse" {
             self.show_mouse_tab(ctx);
             return;
@@ -4428,6 +4630,11 @@ fn presence_color(status: presence::PresenceStatus) -> egui::Color32 {
     }
 }
 
+fn is_teams_window(window: &capture::WindowInfo) -> bool {
+    let identity = format!("{} {}", window.app_name, window.title).to_lowercase();
+    identity.contains("teams")
+}
+
 fn format_duration(seconds: u64) -> String {
     let hours = seconds / 3_600;
     let minutes = (seconds % 3_600) / 60;
@@ -4535,7 +4742,9 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Anteckningar - ASC")
-            .with_inner_size([1024.0, 768.0]),
+            .with_inner_size([1024.0, 768.0])
+            .with_resizable(true)
+            .with_maximize_button(true),
         ..Default::default()
     };
 

@@ -289,12 +289,25 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                 return;
             }
             if let AutomationStep::Wait(duration) = step {
-                let _ = events.send(Event::Status(format!(
-                    "Steg {}: väntar {} sekunder…",
-                    step_index + 1,
-                    duration.as_secs()
-                )));
-                if let Some(reason) = interrupted(&control, &enigo, *duration) {
+                let effective_duration = if config.dry_run {
+                    (*duration).min(Duration::from_millis(300))
+                } else {
+                    *duration
+                };
+                let _ = events.send(Event::Status(if config.dry_run {
+                    format!(
+                        "Steg {}: simulerar inspelad väntan på {:.2} sekunder…",
+                        step_index + 1,
+                        duration.as_secs_f64()
+                    )
+                } else {
+                    format!(
+                        "Steg {}: väntar {:.2} sekunder…",
+                        step_index + 1,
+                        duration.as_secs_f64()
+                    )
+                }));
+                if let Some(reason) = interrupted(&control, &enigo, effective_duration) {
                     let _ = events.send(Event::Stopped(reason));
                     return;
                 }
@@ -307,7 +320,9 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                 max_changed_fraction,
             } = step
             {
-                if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
+                if let Some(reason) =
+                    prepare_sequence_target(active_window_id, config.dry_run, &control, &enigo)
+                {
                     let _ = events.send(Event::Stopped(reason));
                     return;
                 }
@@ -382,7 +397,9 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                 continue;
             }
             if let AutomationStep::Shortcut(shortcut) = step {
-                if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
+                if let Some(reason) =
+                    prepare_sequence_target(active_window_id, config.dry_run, &control, &enigo)
+                {
                     let _ = events.send(Event::Stopped(reason));
                     return;
                 }
@@ -414,7 +431,9 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                 continue;
             }
             if let AutomationStep::TypeText(text) = step {
-                if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
+                if let Some(reason) =
+                    prepare_sequence_target(active_window_id, config.dry_run, &control, &enigo)
+                {
                     let _ = events.send(Event::Stopped(reason));
                     return;
                 }
@@ -467,7 +486,9 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                     y_fraction,
                     button,
                 } => {
-                    if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
+                    if let Some(reason) =
+                        prepare_sequence_target(active_window_id, config.dry_run, &control, &enigo)
+                    {
                         let _ = events.send(Event::Stopped(reason));
                         return;
                     }
@@ -504,21 +525,25 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                         clicks += 1;
                     }
                     let _ = events.send(Event::Activity {
-                        description: format!(
-                            "Steg {}: {} {}klick vid {:.1} %, {:.1} % i målfönstret.",
-                            step_index + 1,
-                            if config.dry_run {
-                                "verifierade"
-                            } else {
-                                "utförde"
-                            },
-                            match button {
-                                PointerButton::Left => "vänster",
-                                PointerButton::Right => "höger",
-                            },
-                            x_fraction * 100.0,
-                            y_fraction * 100.0
-                        ),
+                        description: if config.dry_run {
+                            format!(
+                                "Steg {}: målfönstret finns; beräknad målpunkt är {:.1} %, {:.1} %. Innehållet på punkten är inte bildverifierat.",
+                                step_index + 1,
+                                x_fraction * 100.0,
+                                y_fraction * 100.0
+                            )
+                        } else {
+                            format!(
+                                "Steg {}: utförde {}klick vid {:.1} %, {:.1} % i målfönstret.",
+                                step_index + 1,
+                                match button {
+                                    PointerButton::Left => "vänster",
+                                    PointerButton::Right => "höger",
+                                },
+                                x_fraction * 100.0,
+                                y_fraction * 100.0
+                            )
+                        },
                         moves,
                         clicks,
                         typed_words: 0,
@@ -527,7 +552,9 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                 }
                 _ => continue,
             };
-            if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
+            if let Some(reason) =
+                prepare_sequence_target(active_window_id, config.dry_run, &control, &enigo)
+            {
                 let _ = events.send(Event::Stopped(reason));
                 return;
             }
@@ -591,7 +618,9 @@ pub fn run_ocr_sequence(config: OcrSequenceConfig, control: Receiver<()>, events
                 }
             };
 
-            if let Some(reason) = activate_target(active_window_id, &control, &enigo) {
+            if let Some(reason) =
+                prepare_sequence_target(active_window_id, config.dry_run, &control, &enigo)
+            {
                 let _ = events.send(Event::Stopped(reason));
                 return;
             }
@@ -707,6 +736,23 @@ fn send_shortcut(enigo: &mut Enigo, shortcut: Shortcut) -> Result<(), String> {
     result
         .and(release_result)
         .map_err(|error| format!("Kortkommandot misslyckades: {error}"))
+}
+
+fn prepare_sequence_target(
+    window_id: u32,
+    dry_run: bool,
+    control: &Receiver<()>,
+    enigo: &Enigo,
+) -> Option<String> {
+    if dry_run {
+        if let Some(reason) = interrupted(control, enigo, Duration::ZERO) {
+            return Some(reason);
+        }
+        return crate::capture::window_geometry(window_id)
+            .err()
+            .map(|error| format!("Kunde inte verifiera målfönstret: {error}"));
+    }
+    activate_target(window_id, control, enigo)
 }
 
 fn activate_target(window_id: u32, control: &Receiver<()>, enigo: &Enigo) -> Option<String> {
