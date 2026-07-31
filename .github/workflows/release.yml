@@ -58,7 +58,7 @@ jobs:
         if: matrix.platform == 'windows-latest'
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          gh release upload "v$VERSION" src-tauri/target/release/tauri-app.exe#ASC_Screen_Analyzer_Portable.exe
+          gh release upload "v$VERSION" src-tauri/target/release/tauri-app.exe#ASC_Screen_Analyzer_Portable.exe --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
