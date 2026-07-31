@@ -69,8 +69,12 @@ struct AscApp {
     // Bildförhandsgranskning
     preview_texture: Option<egui::TextureHandle>,
     preview_size: Option<[usize; 2]>,
+    latest_preview_texture: Option<egui::TextureHandle>,
+    latest_preview_size: Option<[usize; 2]>,
     preview_zoom: f32,
     preview_pan: egui::Vec2,
+    follow_latest_preview: bool,
+    selected_preview_file: Option<String>,
 
     // Trådkommunikation
     log_receiver: Option<Receiver<WorkerMessage>>,
@@ -109,8 +113,12 @@ impl Default for AscApp {
             monitors: Vec::new(),
             preview_texture: None,
             preview_size: None,
+            latest_preview_texture: None,
+            latest_preview_size: None,
             preview_zoom: 1.0,
             preview_pan: egui::Vec2::ZERO,
+            follow_latest_preview: true,
+            selected_preview_file: None,
             log_receiver: None,
             control_sender: None,
         };
@@ -178,8 +186,12 @@ impl AscApp {
         self.export_pending = false;
         self.preview_texture = None;
         self.preview_size = None;
+        self.latest_preview_texture = None;
+        self.latest_preview_size = None;
         self.preview_zoom = 1.0;
         self.preview_pan = egui::Vec2::ZERO;
+        self.follow_latest_preview = true;
+        self.selected_preview_file = None;
 
         let (log_tx, log_rx) = channel();
         let (control_tx, control_rx) = channel();
@@ -337,8 +349,12 @@ impl AscApp {
         self.export_pending = false;
         self.preview_texture = None;
         self.preview_size = None;
+        self.latest_preview_texture = None;
+        self.latest_preview_size = None;
         self.preview_zoom = 1.0;
         self.preview_pan = egui::Vec2::ZERO;
+        self.follow_latest_preview = true;
+        self.selected_preview_file = None;
 
         let (log_tx, log_rx) = channel();
         self.log_receiver = Some(log_rx);
@@ -492,9 +508,109 @@ impl AscApp {
 }
 
 impl AscApp {
+    fn display_preview_image(
+        &mut self,
+        image: image::DynamicImage,
+        title: String,
+        ctx: &egui::Context,
+    ) {
+        let rgba = image.to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        self.preview_texture = Some(ctx.load_texture(
+            "preview_image",
+            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+            egui::TextureOptions::default(),
+        ));
+        self.preview_size = Some(size);
+        self.preview_zoom = 1.0;
+        self.preview_pan = egui::Vec2::ZERO;
+        self.follow_latest_preview = false;
+        self.selected_preview_file = Some(title);
+    }
+
+    fn preview_crop(&mut self, ctx: &egui::Context) {
+        if self.crop_w == 0 || self.crop_h == 0 {
+            self.status_text = "Bredd och höjd måste vara större än noll.".to_string();
+            return;
+        }
+
+        let area = (self.crop_x, self.crop_y, self.crop_w, self.crop_h);
+        let result = if self.mode == "live" {
+            capture::capture_source(&self.source_type, self.selected_source_id, Some(area))
+        } else {
+            let directory = Path::new(&self.save_dir);
+            let mut images = fs::read_dir(directory)
+                .map_err(|error| format!("Kunde inte läsa analysmappen: {error}"))
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| {
+                            path.extension().is_some_and(|extension| {
+                                matches!(
+                                    extension.to_string_lossy().to_ascii_lowercase().as_str(),
+                                    "png" | "jpg" | "jpeg"
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+            if let Ok(paths) = &mut images {
+                paths.sort();
+            }
+            images.and_then(|paths| {
+                let path = paths
+                    .first()
+                    .ok_or_else(|| "Inga bilder hittades i analysmappen.".to_string())?;
+                image::open(path)
+                    .map(|image| capture::crop_image(&image, area))
+                    .map_err(|error| format!("Kunde inte öppna {}: {error}", path.display()))
+            })
+        };
+
+        match result {
+            Ok(image) => {
+                self.display_preview_image(image, "Beskärningsprov".to_string(), ctx);
+                self.status_text = "Visar beskärningsprov.".to_string();
+            }
+            Err(error) => self.status_text = format!("Förhandsvisningsfel: {error}"),
+        }
+    }
+
+    fn show_logged_capture(&mut self, log_index: usize, ctx: &egui::Context) {
+        let Some(file_name) = self.logs.get(log_index).map(|log| log.file_name.clone()) else {
+            return;
+        };
+        if file_name.is_empty() {
+            self.status_text =
+                "Klippet sparades inte. Välj en målmapp för att kunna öppna äldre klipp."
+                    .to_string();
+            return;
+        }
+
+        let path = Path::new(&self.save_dir).join(&file_name);
+        match image::open(&path) {
+            Ok(original_image) => {
+                let image = if self.enable_crop && self.mode == "offline" {
+                    capture::crop_image(
+                        &original_image,
+                        (self.crop_x, self.crop_y, self.crop_w, self.crop_h),
+                    )
+                } else {
+                    original_image
+                };
+                self.display_preview_image(image, file_name, ctx);
+            }
+            Err(error) => {
+                self.status_text = format!("Kunde inte öppna {}: {error}", path.display());
+            }
+        }
+    }
+
     fn show_log_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Händelselogg:");
+            ui.weak("Klicka på tiden för att visa klippet");
             if ui.button("Rensa logg").clicked() {
                 self.logs.clear();
                 self.diffs_history.clear();
@@ -526,19 +642,28 @@ impl AscApp {
         ui.separator();
 
         let row_height = ui.text_style_height(&egui::TextStyle::Body).max(18.0);
+        let mut clicked_log = None;
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(
             ui,
             row_height,
             self.logs.len(),
             |ui, visible_rows| {
                 for row in visible_rows {
-                    let log = &self.logs[self.logs.len() - 1 - row];
+                    let log_index = self.logs.len() - 1 - row;
+                    let log = &self.logs[log_index];
                     ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [widths[0], row_height],
-                            egui::Label::new(&log.timestamp).truncate(),
-                        )
-                        .on_hover_text(&log.file_name);
+                        let selected = self.selected_preview_file.as_ref() == Some(&log.file_name)
+                            && !log.file_name.is_empty();
+                        if ui
+                            .add_sized(
+                                [widths[0], row_height],
+                                egui::SelectableLabel::new(selected, &log.timestamp),
+                            )
+                            .on_hover_text("Visa detta skärmklipp")
+                            .clicked()
+                        {
+                            clicked_log = Some(log_index);
+                        }
                         ui.add_sized(
                             [widths[1], row_height],
                             egui::Label::new(format!("{:.2}%", log.pixel_diff * 100.0)).truncate(),
@@ -558,11 +683,32 @@ impl AscApp {
                 }
             },
         );
+        if let Some(log_index) = clicked_log {
+            self.show_logged_capture(log_index, ui.ctx());
+        }
     }
 
     fn show_preview_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("Senaste skärmklipp:");
+            let title = self
+                .selected_preview_file
+                .as_deref()
+                .map_or("Senaste skärmklipp", |file| file);
+            ui.label(format!("Visar: {title}"));
+            if ui
+                .add_enabled(!self.follow_latest_preview, egui::Button::new("Senaste"))
+                .on_hover_text("Återgå till det senaste skärmklippet")
+                .clicked()
+            {
+                self.follow_latest_preview = true;
+                self.selected_preview_file = None;
+                if let Some(texture) = self.latest_preview_texture.as_ref() {
+                    self.preview_texture = Some(texture.clone());
+                    self.preview_size = self.latest_preview_size;
+                }
+                self.preview_zoom = 1.0;
+                self.preview_pan = egui::Vec2::ZERO;
+            }
             if ui
                 .button("Anpassa")
                 .on_hover_text("Visa hela bilden")
@@ -664,12 +810,17 @@ impl eframe::App for AscApp {
                     WorkerMessage::Preview(rgba_bytes, w, h) => {
                         let color_image =
                             egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba_bytes);
-                        self.preview_texture = Some(ctx.load_texture(
+                        let texture = ctx.load_texture(
                             "preview_image",
                             color_image,
                             egui::TextureOptions::default(),
-                        ));
-                        self.preview_size = Some([w, h]);
+                        );
+                        self.latest_preview_texture = Some(texture.clone());
+                        self.latest_preview_size = Some([w, h]);
+                        if self.follow_latest_preview {
+                            self.preview_texture = Some(texture);
+                            self.preview_size = Some([w, h]);
+                        }
                     }
                     WorkerMessage::Error(err) => {
                         self.status_text = format!("Fel: {}", err);
@@ -850,6 +1001,9 @@ impl eframe::App for AscApp {
                                 ui.label("Höjd:");
                                 ui.add(egui::DragValue::new(&mut self.crop_h));
                             });
+                            if ui.button("Förhandsgranska beskärning").clicked() {
+                                self.preview_crop(ctx);
+                            }
                         });
                     }
                     ui.add_space(5.0);
