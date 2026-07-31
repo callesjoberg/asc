@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, serde::Serialize)]
 struct LogItem {
@@ -59,6 +59,8 @@ struct AscApp {
     diffs_history: Vec<f64>,
     total_captures: usize,
     total_changes: usize,
+    export_pending: bool,
+    last_export_at: Instant,
 
     // Källlistor (cachar)
     windows: Vec<capture::WindowInfo>,
@@ -101,6 +103,8 @@ impl Default for AscApp {
             diffs_history: Vec::new(),
             total_captures: 0,
             total_changes: 0,
+            export_pending: false,
+            last_export_at: Instant::now(),
             windows: Vec::new(),
             monitors: Vec::new(),
             preview_texture: None,
@@ -171,6 +175,7 @@ impl AscApp {
         self.diffs_history.clear();
         self.total_captures = 0;
         self.total_changes = 0;
+        self.export_pending = false;
         self.preview_texture = None;
         self.preview_size = None;
         self.preview_zoom = 1.0;
@@ -329,6 +334,7 @@ impl AscApp {
         self.diffs_history.clear();
         self.total_captures = 0;
         self.total_changes = 0;
+        self.export_pending = false;
         self.preview_texture = None;
         self.preview_size = None;
         self.preview_zoom = 1.0;
@@ -500,38 +506,58 @@ impl AscApp {
             }
         });
 
-        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("log_grid")
-                .striped(true)
-                .num_columns(4)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Tid");
-                    ui.label("Diff %");
-                    ui.label("OCR-text");
-                    ui.label("Status");
-                    ui.end_row();
+        let spacing = ui.spacing().item_spacing.x;
+        let timestamp_width = 68.0;
+        let diff_width = 58.0;
+        let status_width = 88.0;
+        let ocr_width =
+            (ui.available_width() - timestamp_width - diff_width - status_width - spacing * 3.0)
+                .max(60.0);
+        let widths = [timestamp_width, diff_width, ocr_width, status_width];
 
-                    for log in self.logs.iter().rev() {
-                        ui.label(&log.timestamp).on_hover_text(&log.file_name);
-                        ui.label(format!("{:.2}%", log.pixel_diff * 100.0));
-
-                        let short_ocr = if log.ocr_text.chars().count() > 25 {
-                            format!("{}...", log.ocr_text.chars().take(25).collect::<String>())
-                        } else {
-                            log.ocr_text.clone()
-                        };
-                        ui.label(short_ocr).on_hover_text(&log.ocr_text);
-
-                        if log.is_changed {
-                            ui.colored_label(egui::Color32::GREEN, "Ändrad");
-                        } else {
-                            ui.label("Ingen ändring");
-                        }
-                        ui.end_row();
-                    }
-                });
+        ui.horizontal(|ui| {
+            for (label, width) in ["Tid", "Diff %", "OCR-text", "Status"]
+                .into_iter()
+                .zip(widths)
+            {
+                ui.add_sized([width, 18.0], egui::Label::new(label).truncate());
+            }
         });
+        ui.separator();
+
+        let row_height = ui.text_style_height(&egui::TextStyle::Body).max(18.0);
+        egui::ScrollArea::vertical().auto_shrink(false).show_rows(
+            ui,
+            row_height,
+            self.logs.len(),
+            |ui, visible_rows| {
+                for row in visible_rows {
+                    let log = &self.logs[self.logs.len() - 1 - row];
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [widths[0], row_height],
+                            egui::Label::new(&log.timestamp).truncate(),
+                        )
+                        .on_hover_text(&log.file_name);
+                        ui.add_sized(
+                            [widths[1], row_height],
+                            egui::Label::new(format!("{:.2}%", log.pixel_diff * 100.0)).truncate(),
+                        );
+                        ui.add_sized(
+                            [widths[2], row_height],
+                            egui::Label::new(&log.ocr_text).truncate(),
+                        )
+                        .on_hover_text(&log.ocr_text);
+                        let status = if log.is_changed {
+                            egui::RichText::new("Ändrad").color(egui::Color32::GREEN)
+                        } else {
+                            egui::RichText::new("Ingen ändring")
+                        };
+                        ui.add_sized([widths[3], row_height], egui::Label::new(status).truncate());
+                    });
+                }
+            },
+        );
     }
 
     fn show_preview_panel(&mut self, ui: &mut egui::Ui) {
@@ -660,9 +686,20 @@ impl eframe::App for AscApp {
             self.log_receiver = None;
         }
         if analysis_changed {
+            self.export_pending = true;
+        }
+        let export_interval = Duration::from_secs(1);
+        let export_elapsed = self.last_export_at.elapsed();
+        let export_due =
+            self.export_pending && (should_clear_receiver || export_elapsed >= export_interval);
+        if export_due {
             if let Err(error) = self.export_analysis() {
                 self.status_text = format!("Exportfel: {error}");
             }
+            self.export_pending = false;
+            self.last_export_at = Instant::now();
+        } else if self.export_pending {
+            ctx.request_repaint_after(export_interval - export_elapsed);
         }
 
         // Definiera det övergripande gränssnittet
