@@ -46,14 +46,21 @@ const ocrY = document.getElementById('ocr-y');
 const ocrW = document.getElementById('ocr-w');
 const ocrH = document.getElementById('ocr-h');
 
-// Initiera appen
-document.addEventListener('DOMContentLoaded', () => {
+// Initiera appen robust
+function initApp() {
+  if (chart) return; // Undvik dubbelinitiering
   chart = new LineChart('diff-chart');
   
   loadSources();
   setupEventListeners();
   checkCurrentStatus();
-});
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initApp);
+} else {
+  initApp();
+}
 
 // Kontrollera om en backend-loop redan körs (t.ex. om appen laddas om)
 async function checkCurrentStatus() {
